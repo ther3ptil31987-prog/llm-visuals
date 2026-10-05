@@ -13,6 +13,7 @@ use ratatui::{
 use crate::bandwidth::{self, StageId};
 use crate::colors::{self as pal, ColorTheme};
 use crate::config::ViewMode;
+use crate::dblog::{ContextSpeed, LogSummary};
 use crate::fade::FadeState;
 use crate::gpu::GpuStats;
 use crate::model_detect::DetectedModel;
@@ -20,6 +21,7 @@ use crate::observe::{ExpertStats, LiveStats};
 use crate::perf::{Meter, PerfTracker, Phase, RequestRecord};
 use crate::pipeline::{GeneratedText, TokenBuffer};
 use crate::settings::{Kind, SettingsForm};
+use crate::vision::{Place, Vision};
 
 const HEATMAP_TOKEN_WIDTH: usize = 40;
 /// Most model rows the strip under the header will show before it scrolls.
@@ -48,7 +50,7 @@ pub struct Dashboard<'a> {
     pub focus: usize,
     pub detected: Option<&'a DetectedModel>,
     pub gpus: &'a [GpuStats],
-    /// Why the last nvidia-smi poll produced nothing, if it failed.
+    /// Why the last GPU telemetry poll produced nothing, if it failed.
     pub gpu_error: Option<&'a str>,
     pub fade: &'a FadeState,
     pub perf: &'a PerfTracker,
@@ -64,8 +66,15 @@ pub struct Dashboard<'a> {
     pub demo: bool,
     /// Real routing from the patched server, when available.
     pub experts: Option<&'a ExpertStats>,
+    /// GPU telemetry backend: "nvml", "smi", "xpu", "amd", or "demo".
+    pub gpu_backend: Option<&'a str>,
     /// The settings screen, drawn over the view while it is open.
     pub settings: Option<&'a SettingsForm>,
+    /// The log viewer (`l`): what was read from the database, or why not.
+    pub log: Option<&'a Result<LogSummary, String>>,
+    /// The context-speed screen (`c`): per-model buckets or why not, and
+    /// which model is shown.
+    pub ctx_speed: Option<(&'a Result<Vec<ContextSpeed>, String>, usize)>,
 }
 
 pub struct Renderer {
@@ -105,13 +114,20 @@ impl Renderer {
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         d: &Dashboard,
     ) {
+        pal::set_chrome(self.theme.chrome);
         let _ = terminal.try_draw(|frame: &mut Frame| -> Result<(), io::Error> {
             let area = frame.area();
             frame.render_widget(
-                Block::default().style(Style::default().bg(pal::c(pal::BG))),
+                Block::default().style(Style::default().bg(pal::c(pal::chrome().bg))),
                 area,
             );
             self.render_view(frame, area, d);
+            if let Some(log) = d.log {
+                self.render_log(frame, area, log);
+            }
+            if let Some((speeds, sel)) = d.ctx_speed {
+                self.render_ctx_speed(frame, area, speeds, sel);
+            }
             if let Some(form) = d.settings {
                 self.render_settings(frame, area, form);
             }
@@ -170,7 +186,17 @@ impl Renderer {
     fn render_panels(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
         let n_gpus = d.gpus.len();
         let h = area.height;
-        let gpu_rows = (3 * n_gpus.max(1) as u16 + 2).max(9);
+        let host = &d.perf.bw.host;
+        let ram_rows = if host.mem_total_bytes.is_some() && host.mem_available_bytes.is_some() {
+            3
+        } else {
+            0
+        };
+        // One blank line between the cards in the GPUs panel, and one
+        // above the RAM section when it shows.
+        let gpu_gap = n_gpus.saturating_sub(1) as u16;
+        let ram_gap = u16::from(ram_rows > 0);
+        let gpu_rows = (3 * n_gpus.max(1) as u16 + 2).max(9) + gpu_gap + ram_gap + ram_rows;
         let show_requests = h >= 22;
         let show_ctx = h >= 16;
         let req_h = if show_requests { 7 } else { 0 };
@@ -313,84 +339,123 @@ impl Renderer {
         let sep = || Span::styled("  ·  ", Style::default().fg(pal::c(pal::TEXT_MUTED)));
         match d.detected {
             Some(m) => {
-                spans.push(Span::styled(
-                    format!(" {}", m.name),
-                    Style::default()
-                        .fg(pal::c(pal::WHITE))
-                        .add_modifier(Modifier::BOLD),
+                // Segments in display order, each with a keep priority: when
+                // the line is too wide the lowest goes first, so the name,
+                // the vision placement and the demo label outlast the details
+                // other panels also show.
+                let mut segs: Vec<(u8, Vec<Span>)> = Vec::new();
+                let st = |rgb| Style::default().fg(pal::c(rgb));
+                segs.push((
+                    u8::MAX,
+                    vec![Span::styled(
+                        format!(" {}", m.name),
+                        st(pal::WHITE).add_modifier(Modifier::BOLD),
+                    )],
                 ));
-                spans.push(sep());
-                spans.push(Span::styled(
-                    m.engine.clone(),
-                    Style::default().fg(pal::c(pal::TEXT)),
-                ));
-                spans.push(Span::styled(
-                    format!(" pid {}", m.pid),
-                    Style::default().fg(pal::c(pal::TEXT_DIM)),
+                segs.push((
+                    8,
+                    vec![
+                        Span::styled(m.engine.clone(), st(pal::TEXT)),
+                        Span::styled(format!(" pid {}", m.pid), st(pal::TEXT_DIM)),
+                    ],
                 ));
                 if let Some(g) = &m.gguf {
-                    spans.push(sep());
-                    spans.push(Span::styled(
-                        g.architecture.clone(),
-                        Style::default().fg(pal::c(pal::TEXT)),
-                    ));
-                    spans.push(sep());
-                    spans.push(Span::styled(
-                        format!("{}L × {}H", g.n_layers, g.n_heads),
-                        Style::default().fg(pal::c(pal::TEXT)),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" ({} KV)", g.n_kv_heads),
-                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    segs.push((4, vec![Span::styled(g.architecture.clone(), st(pal::TEXT))]));
+                    segs.push((
+                        5,
+                        vec![
+                            Span::styled(
+                                format!("{}L × {}H", g.n_layers, g.n_heads),
+                                st(pal::TEXT),
+                            ),
+                            Span::styled(format!(" ({} KV)", g.n_kv_heads), st(pal::TEXT_DIM)),
+                        ],
                     ));
                     if g.is_moe() {
-                        spans.push(sep());
-                        spans.push(Span::styled(
-                            format!("MoE {}/{}", g.n_experts_used, g.n_experts),
-                            Style::default().fg(pal::c(pal::VIOLET)),
+                        segs.push((
+                            6,
+                            vec![Span::styled(
+                                format!("MoE {}/{}", g.n_experts_used, g.n_experts),
+                                st(pal::VIOLET),
+                            )],
                         ));
                     }
                     if g.n_mtp > 0 {
-                        spans.push(sep());
-                        spans.push(Span::styled(
-                            format!("MTP ×{}", g.n_mtp),
-                            Style::default().fg(pal::c(pal::AMBER)),
+                        segs.push((
+                            6,
+                            vec![Span::styled(format!("MTP ×{}", g.n_mtp), st(pal::AMBER))],
                         ));
                     }
                     if let Some(e) = &g.engram {
-                        spans.push(sep());
-                        spans.push(Span::styled(
-                            format!("engram {}-gram", e.ngram_size),
-                            Style::default().fg(pal::c(pal::VIOLET)),
+                        segs.push((
+                            3,
+                            vec![Span::styled(
+                                format!("engram {}-gram", e.ngram_size),
+                                st(pal::VIOLET),
+                            )],
                         ));
                     }
                 }
+                if let Some((place, device)) =
+                    m.vision.as_ref().and_then(|v| vision_label(v, d.gpus))
+                {
+                    let mut seg = vec![
+                        Span::styled("vision ", st(pal::MAGENTA)),
+                        Span::styled(place, st(pal::WHITE).add_modifier(Modifier::BOLD)),
+                    ];
+                    if let Some(dev) = device {
+                        seg.push(Span::styled(format!(" ({dev})"), st(pal::TEXT_DIM)));
+                    }
+                    segs.push((9, seg));
+                }
                 if let Some(q) = quant_from_path(m) {
-                    spans.push(sep());
-                    spans.push(Span::styled(q, Style::default().fg(pal::c(pal::TEAL))));
+                    segs.push((2, vec![Span::styled(q, st(pal::TEAL))]));
                 }
                 if !m.tensor_split.is_empty() {
-                    spans.push(sep());
-                    spans.push(Span::styled(
-                        format!(
-                            "split {}",
-                            m.tensor_split
-                                .iter()
-                                .map(|s| format!("{s:.0}"))
-                                .collect::<Vec<_>>()
-                                .join("/")
-                        ),
-                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    let split = m
+                        .tensor_split
+                        .iter()
+                        .map(|s| format!("{s:.0}"))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    segs.push((
+                        1,
+                        vec![Span::styled(format!("split {split}"), st(pal::TEXT_DIM))],
                     ));
                 }
                 if d.demo {
-                    spans.push(sep());
-                    spans.push(Span::styled(
-                        "synthetic demo",
-                        Style::default()
-                            .fg(pal::c(pal::AMBER))
-                            .add_modifier(Modifier::ITALIC),
+                    segs.push((
+                        10,
+                        vec![Span::styled(
+                            "synthetic demo",
+                            st(pal::AMBER).add_modifier(Modifier::ITALIC),
+                        )],
                     ));
+                }
+                let sep_w = sep().content.chars().count();
+                let width = |segs: &[(u8, Vec<Span>)]| -> usize {
+                    segs.iter()
+                        .map(|(_, v)| v.iter().map(|x| x.content.chars().count()).sum::<usize>())
+                        .sum::<usize>()
+                        + sep_w * segs.len().saturating_sub(1)
+                };
+                while width(&segs) > inner.width as usize {
+                    let Some(lowest) = segs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (p, _))| *p < u8::MAX)
+                        .min_by_key(|(_, (p, _))| *p)
+                        .map(|(i, _)| i)
+                    else {
+                        break;
+                    };
+                    segs.remove(lowest);
+                }
+                for (k, (_, seg)) in segs.into_iter().enumerate() {
+                    if k > 0 {
+                        spans.push(sep());
+                    }
+                    spans.extend(seg);
                 }
             }
             None => {
@@ -574,10 +639,14 @@ impl Renderer {
     // -----------------------------------------------------------------------
 
     fn render_gpus(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let tag = match d.gpu_backend {
+            Some(backend) if !backend.is_empty() => format!(" · {backend}"),
+            _ => String::new(),
+        };
         let title = if d.gpus.len() > 1 {
-            format!(" ◆ GPUS  {} devices ", d.gpus.len())
+            format!(" ◆ GPUS  {} devices{} ", d.gpus.len(), tag)
         } else {
-            " ◆ GPU ".to_string()
+            format!(" ◆ GPU{} ", tag)
         };
         let total_w: f32 = d.gpus.iter().map(|g| g.power_watts).sum();
         let right = Line::from(Span::styled(
@@ -588,6 +657,19 @@ impl Renderer {
         let (block, _) = with_right(panel(&title, pal::AMBER), &title, right, area);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        let n = d.gpus.len() as u16;
+        let (cards, ram_h, gap) = gpu_split(inner.height, n, ram_rows(inner.height, n.max(1), d));
+        if ram_h > 0 {
+            let ram = Rect::new(inner.x, inner.y + inner.height - ram_h, inner.width, ram_h);
+            self.render_ram(frame, ram, d);
+        }
+        let ram_gap = u16::from(gap && ram_h > 0);
+        let inner = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height - ram_h - ram_gap,
+        );
         if d.gpus.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -603,7 +685,7 @@ impl Renderer {
                                 "— {}",
                                 truncate(e, inner.width.saturating_sub(20) as usize)
                             ),
-                            None => "— nvidia-smi returned nothing. --demo simulates two cards."
+                            None => "— no supported GPU telemetry. --demo simulates two cards."
                                 .to_string(),
                         },
                         Style::default().fg(pal::c(pal::TEXT_DIM)),
@@ -613,17 +695,15 @@ impl Renderer {
             );
             return;
         }
-        let n = d.gpus.len() as u16;
-        let per = (inner.height / n).max(1);
         let mut y = inner.y;
-        for g in d.gpus {
+        for (g, &h) in d.gpus.iter().zip(&cards) {
             if y >= inner.y + inner.height {
                 break;
             }
-            let h = per.min(inner.y + inner.height - y);
+            let h = h.max(1).min(inner.y + inner.height - y);
             let card = Rect::new(inner.x, y, inner.width, h);
             self.render_gpu_card(frame, card, g, d);
-            y += h;
+            y += h + u16::from(gap);
         }
     }
 
@@ -646,7 +726,12 @@ impl Renderer {
         let temp_col = pal::gradient_color(pal::TEMP, (temp - 30.0) / 65.0);
         let mut tail: Vec<Span> = vec![
             Span::styled(
-                format!(" {:>3.0}%", util * 100.0),
+                // "~": reconstructed from clocks, not a driver sample.
+                format!(
+                    "{}{:>3.0}%",
+                    if g.util_estimated { "~" } else { " " },
+                    util * 100.0
+                ),
                 Style::default()
                     .fg(pal::vu(util))
                     .add_modifier(Modifier::BOLD),
@@ -677,6 +762,13 @@ impl Renderer {
                 format!("  fan {f:>2.0}%"),
                 Style::default().fg(pal::c(pal::TEXT_DIM)),
             ));
+        } else if let Some(rpm) = g.fan_rpm {
+            // Intel xe exposes a tachometer, not a PWM percent. 0 RPM at
+            // idle means the fans are stopped — say "0" like a BIOS would.
+            extras.push(Span::styled(
+                format!("  fan {rpm:>4.0}RPM"),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
         }
         if g.pcie_gen > 0 {
             extras.push(Span::styled(
@@ -692,12 +784,20 @@ impl Renderer {
         }
         tail.extend(extras);
         let bar_w = w.saturating_sub(fixed).clamp(4, 30);
-        let mut spans = vec![Span::styled(
-            name.clone(),
+        // Highlight cards the focused model is pinned to (affinity /
+        // gpu_indices): white for its cards, grey for everyone else's.
+        let affinity = d
+            .detected
+            .map(|m| m.gpu_indices.is_empty() || m.gpu_indices.contains(&g.index))
+            .unwrap_or(true);
+        let name_style = if affinity {
             Style::default()
                 .fg(pal::c(pal::WHITE))
-                .add_modifier(Modifier::BOLD),
-        )];
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal::c(pal::TEXT_DIM))
+        };
+        let mut spans = vec![Span::styled(name.clone(), name_style)];
         spans.extend(gauge(util, util_peak, bar_w, GaugeStyle::Vu));
         spans.extend(tail);
         lines.push(Line::from(spans));
@@ -784,16 +884,41 @@ impl Renderer {
                 ));
             }
             if legend_w > 0 {
-                spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
-                spans.push(Span::styled(
-                    format!(" w {:.1}G ", weights * g.vram_total_gb()),
-                    Style::default().fg(pal::c(pal::TEXT_DIM)),
-                ));
-                spans.push(Span::styled("■", Style::default().fg(pal::c(pal::TEAL))));
-                spans.push(Span::styled(
-                    format!(" kv {:.1}G", kv * g.vram_total_gb()),
-                    Style::default().fg(pal::c(pal::TEXT_DIM)),
-                ));
+                // Describe what actually occupies the card: the focused
+                // model if it lives here, else the tenant that does, never
+                // another engine's memory passed off as this model's KV.
+                let owns = |f: &FadeState| f.model_owned.get(gi).copied();
+                let wk = if owns(d.fade).unwrap_or(true) {
+                    Some((weights, kv))
+                } else {
+                    tenants
+                        .iter()
+                        .map(|&i| d.models[i].fade)
+                        .find(|f| owns(f).unwrap_or(false))
+                        .map(|f| {
+                            (
+                                f.weight_frac.get(gi).copied().unwrap_or(0.0),
+                                f.kv_alloc_frac.get(gi).copied().unwrap_or(0.0),
+                            )
+                        })
+                };
+                if let Some((wt, kt)) = wk {
+                    spans.push(Span::styled("■", Style::default().fg(pal::c(pal::BLUE))));
+                    spans.push(Span::styled(
+                        format!(" w {:.1}G ", wt * g.vram_total_gb()),
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
+                    spans.push(Span::styled("■", Style::default().fg(pal::c(pal::TEAL))));
+                    spans.push(Span::styled(
+                        format!(" kv {:.1}G", kt * g.vram_total_gb()),
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        " other server",
+                        Style::default().fg(pal::c(pal::TEXT_DIM)),
+                    ));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -830,6 +955,94 @@ impl Renderer {
                 spans.push(Span::raw("  "));
                 spans.extend(pw);
                 let _ = i;
+                lines.push(Line::from(spans));
+            }
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+
+    /// System memory under the GPU cards: a rule, a used / cache / free bar
+    /// and the used-percent history.
+    fn render_ram(&self, frame: &mut Frame, area: Rect, d: &Dashboard) {
+        let host = &d.perf.bw.host;
+        let (Some(total), Some(avail)) = (host.mem_total_bytes, host.mem_available_bytes) else {
+            return;
+        };
+        let w = area.width as usize;
+        let total_f = total.max(1) as f32;
+        let used = total.saturating_sub(avail) as f32 / total_f;
+        // Page cache is mostly reclaimable, so it sits inside "available".
+        let cache = host
+            .page_cache_bytes
+            .map(|c| c.min(avail) as f32 / total_f)
+            .unwrap_or(0.0);
+        let gb = |b: f32| b * total_f / 1e9;
+        let mut lines: Vec<Line> = Vec::new();
+
+        if area.height >= 3 {
+            let title = " SYSTEM RAM ";
+            lines.push(Line::from(vec![
+                Span::styled("╶─", Style::default().fg(pal::c(pal::chrome().border))),
+                Span::styled(
+                    title,
+                    Style::default()
+                        .fg(pal::c(pal::accent(pal::VIOLET)))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "─".repeat(w.saturating_sub(title.len() + 2)),
+                    Style::default().fg(pal::c(pal::chrome().border)),
+                ),
+            ]));
+        }
+
+        let label = format!("{:<12}", "   RAM");
+        let txt = format!(" {:>4.1}/{:<4.1}G ", gb(used), gb(1.0));
+        let mut legend: Vec<Span> = Vec::new();
+        if host.page_cache_bytes.is_some() {
+            legend.push(Span::styled("▒", Style::default().fg(pal::c(pal::VIOLET))));
+            legend.push(Span::styled(
+                format!(" cache {:.1}G ", gb(cache)),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+        }
+        if let Some(r) = host.rss_bytes.filter(|_| d.detected.is_some()) {
+            legend.push(Span::styled(
+                format!("model {:.1}G", r as f32 / 1e9),
+                Style::default().fg(pal::c(pal::TEXT_DIM)),
+            ));
+        }
+        let legend_w: usize = legend.iter().map(|s| s.content.chars().count()).sum();
+        let legend_w = if w > label.len() + txt.len() + legend_w + 20 {
+            legend_w
+        } else {
+            legend.clear();
+            0
+        };
+        let bar_w = w
+            .saturating_sub(label.len() + txt.len() + legend_w)
+            .clamp(4, 40);
+        let mut spans = vec![Span::styled(
+            label,
+            Style::default().fg(pal::c(pal::TEXT_DIM)),
+        )];
+        spans.extend(ram_bar(bar_w, used, cache));
+        spans.push(Span::styled(
+            txt,
+            Style::default()
+                .fg(pal::vu(used))
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.extend(legend);
+        lines.push(Line::from(spans));
+
+        let spark_rows = area.height as usize - lines.len();
+        if spark_rows > 0 {
+            let label_w = 3;
+            let hist: Vec<f32> = d.perf.bw.ram_used_hist.iter().copied().collect();
+            for row in sparkline(&hist, w.saturating_sub(label_w), spark_rows, 100.0, pal::VU) {
+                let mut spans = vec![Span::raw(" ".repeat(label_w))];
+                spans.extend(row);
                 lines.push(Line::from(spans));
             }
         }
@@ -969,9 +1182,14 @@ impl Renderer {
                     } else {
                         a
                     };
-                    Span::styled("▌", Style::default().fg(pal::c(c)).bg(pal::c(pal::TRACK)))
+                    Span::styled(
+                        "▌",
+                        Style::default()
+                            .fg(pal::c(c))
+                            .bg(pal::c(pal::chrome().track)),
+                    )
                 }
-                _ => Span::styled("█", Style::default().fg(pal::c(pal::TRACK))),
+                _ => Span::styled("█", Style::default().fg(pal::c(pal::chrome().track))),
             };
             spans.push(span);
         }
@@ -996,7 +1214,10 @@ impl Renderer {
                 Style::default().fg(pal::c(pal::TEXT_DIM)),
             ));
             if two_lines {
-                spans.push(Span::styled("  ■", Style::default().fg(pal::c(pal::TRACK))));
+                spans.push(Span::styled(
+                    "  ■",
+                    Style::default().fg(pal::c(pal::chrome().track)),
+                ));
                 spans.push(Span::styled(
                     format!(" free {}", fmt_int(ctx_max.saturating_sub(used))),
                     Style::default().fg(pal::c(pal::TEXT_DIM)),
@@ -1032,11 +1253,21 @@ impl Renderer {
                 .and_then(|m| m.spec_type.clone())
                 .unwrap_or_default()
         };
-        let depth = d
-            .detected
-            .and_then(|m| m.gguf.as_ref())
-            .map(|g| g.n_mtp)
-            .unwrap_or(d.live.spec_depth);
+        // llama.cpp applies the model's MTP layers (the header's "MTP ×N") up
+        // to this many times per verification step.
+        let draft_max = d.detected.and_then(|m| {
+            cmd_arg(&m.cmdline, "--spec-draft-n-max")
+                .or_else(|| cmd_arg(&m.cmdline, "--draft-max"))
+                .or_else(|| cmd_arg(&m.cmdline, "--draft"))
+        });
+        // Depth is tokens drafted per step, as vLLM and SGLang report it. The
+        // MTP layer count is only a fallback: one layer can draft several.
+        let depth = draft_max
+            .as_deref()
+            .and_then(|n| n.parse().ok())
+            .or((d.live.spec_depth > 0).then_some(d.live.spec_depth))
+            .or_else(|| d.detected.and_then(|m| m.gguf.as_ref()).map(|g| g.n_mtp))
+            .unwrap_or(0);
         let enabled = !spec_type.is_empty() && spec_type != "none";
         let mtp = spec_type.to_ascii_lowercase().contains("mtp");
         let title = if !enabled {
@@ -1080,9 +1311,7 @@ impl Renderer {
                         Style::default().fg(pal::c(pal::TEAL)),
                     ));
                 }
-                if let Some(n) =
-                    cmd_arg(&m.cmdline, "--draft-max").or_else(|| cmd_arg(&m.cmdline, "--draft"))
-                {
+                if let Some(n) = &draft_max {
                     facts.push(Span::styled(
                         format!("  ·  draft max {n}"),
                         Style::default().fg(pal::c(pal::TEXT)),
@@ -1204,7 +1433,19 @@ impl Renderer {
         }
         let f = d.fade;
         let n = f.n_layers;
-        let n_gpus = d.gpus.len().max(1);
+        // Count the GPUs the focused model actually uses, not every visible
+        // card — a single-GPU server on a 4-GPU host serves on 1 GPU.
+        let model_gpu_count = d
+            .detected
+            .map(|m| {
+                if m.gpu_indices.is_empty() {
+                    d.gpus.len().max(1)
+                } else {
+                    m.gpu_indices.len()
+                }
+            })
+            .unwrap_or_else(|| d.gpus.len().max(1));
+        let n_gpus = model_gpu_count;
         let title = format!(
             " ◆ LAYERS  {n} across {n_gpus} GPU{} ",
             if n_gpus > 1 { "s" } else { "" }
@@ -1515,7 +1756,7 @@ impl Renderer {
             }
             m
         };
-        let gap_style = Style::default().bg(pal::c(pal::BG));
+        let gap_style = Style::default().bg(pal::c(pal::chrome().bg));
         let mut lines: Vec<Line> = Vec::with_capacity(h);
         let text_rows = if half { (n_slots + 1) / 2 } else { n_slots };
         for r in 0..text_rows.min(h) {
@@ -1755,6 +1996,8 @@ impl Renderer {
         }
         items.push(("t", format!("theme:{}", d.theme_name), false));
         items.push(("s", "settings".into(), d.settings.is_some()));
+        items.push(("l", "log".into(), d.log.is_some()));
+        items.push(("c", "ctx speed".into(), d.ctx_speed.is_some()));
         items.push(("r", "rescan".into(), false));
 
         let cost = |it: &[(&str, String, bool)]| -> usize {
@@ -1768,6 +2011,7 @@ impl Renderer {
                     "t" => *l = "theme".into(),
                     "b" => *l = "bw".into(),
                     "s" => *l = "set".into(),
+                    "c" => *l = "ctx".into(),
                     "↹" => *l = format!("{}/{}", d.focus + 1, d.models.len()),
                     _ => {}
                 }
@@ -1779,14 +2023,22 @@ impl Renderer {
 
         let mut spans: Vec<Span> = Vec::new();
         for (k, label, active) in &items {
-            let kc = if *active { pal::CYAN } else { pal::TEXT };
+            let kc = if *active {
+                pal::accent(pal::CYAN)
+            } else {
+                pal::TEXT
+            };
             spans.push(Span::styled(
                 format!(" {k}"),
                 Style::default().fg(pal::c(kc)).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 format!(" {label}"),
-                Style::default().fg(pal::c(if *active { pal::CYAN } else { pal::TEXT_DIM })),
+                Style::default().fg(pal::c(if *active {
+                    pal::accent(pal::CYAN)
+                } else {
+                    pal::TEXT_DIM
+                })),
             ));
         }
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1807,7 +2059,8 @@ impl Renderer {
             ));
         }
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(pal::c(pal::PANEL))),
+            Paragraph::new(Line::from(spans))
+                .style(Style::default().bg(pal::c(pal::chrome().panel))),
             area,
         );
     }
@@ -1828,7 +2081,8 @@ impl Renderer {
             height,
         };
         frame.render_widget(Clear, rect);
-        let block = panel(" settings ", pal::CYAN);
+        let title = concat!(" settings · v", env!("CARGO_PKG_VERSION"), " ");
+        let block = panel(title, pal::CYAN);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
@@ -1838,10 +2092,16 @@ impl Renderer {
         let mut lines: Vec<Line> = Vec::new();
         for (i, f) in form.fields.iter().enumerate() {
             let sel = i == form.selected;
-            let fg = if sel { pal::CYAN } else { pal::TEXT };
+            let fg = if sel {
+                pal::accent(pal::CYAN)
+            } else {
+                pal::TEXT
+            };
             let mut style = Style::default().fg(pal::c(fg));
             if sel {
-                style = style.bg(pal::c(pal::TRACK)).add_modifier(Modifier::BOLD);
+                style = style
+                    .bg(pal::c(pal::chrome().track))
+                    .add_modifier(Modifier::BOLD);
             }
             let value = match (&form.editing, f.kind) {
                 (Some(buf), _) if sel => format!("{buf}▏"),
@@ -1901,6 +2161,331 @@ impl Renderer {
             spans.push(Span::styled(format!(" {label} "), dim));
         }
         lines.push(Line::from(fit_spans(&spans, w)));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Log viewer (l)
+// ---------------------------------------------------------------------------
+
+fn fmt_unix(ts: f64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "?".into())
+}
+
+impl Renderer {
+    fn render_log(&self, frame: &mut Frame, area: Rect, log: &Result<LogSummary, String>) {
+        let width = area.width.saturating_sub(4).min(120);
+        // An error needs four lines, the tables the whole screen.
+        let height = match log {
+            Ok(_) => area.height.saturating_sub(2),
+            Err(_) => 6.min(area.height),
+        };
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, rect);
+        let block = panel(" ◆ LOG DATABASE ", pal::GREEN);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let w = inner.width as usize;
+        let h = inner.height as usize;
+        let text = Style::default().fg(pal::c(pal::TEXT));
+        let dim = Style::default().fg(pal::c(pal::TEXT_DIM));
+        let head = Style::default()
+            .fg(pal::c(pal::accent(pal::GREEN)))
+            .add_modifier(Modifier::BOLD);
+        let keys = Line::from(fit_spans(
+            &[
+                Span::styled(" r", text.add_modifier(Modifier::BOLD)),
+                Span::styled(" refresh ", dim),
+                Span::styled(" esc", text.add_modifier(Modifier::BOLD)),
+                Span::styled(" close ", dim),
+            ],
+            w,
+        ));
+        let mut lines: Vec<Line> = Vec::new();
+        let sum = match log {
+            Ok(sum) => sum,
+            Err(e) => {
+                lines.push(Line::styled(
+                    truncate(&format!(" {e}"), w),
+                    Style::default().fg(pal::c(pal::MAGENTA)),
+                ));
+                lines.push(Line::styled(
+                    truncate(" Logging writes here with --log-db (on by default).", w),
+                    dim,
+                ));
+                lines.push(Line::raw(""));
+                lines.push(keys);
+                frame.render_widget(Paragraph::new(lines), inner);
+                return;
+            }
+        };
+        let row = |label: &str, value: String| {
+            Line::from(vec![
+                Span::styled(format!(" {label:<6}"), dim),
+                Span::styled(truncate(&value, w.saturating_sub(7)), text),
+            ])
+        };
+        lines.push(row(
+            "file",
+            format!(
+                "{:.1} MB  {}",
+                sum.bytes as f64 / (1024.0 * 1024.0),
+                sum.path.display()
+            ),
+        ));
+        lines.push(row(
+            "rows",
+            sum.counts
+                .iter()
+                .map(|(t, n)| format!("{t} {}", fmt_int(*n as usize)))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        ));
+        lines.push(row(
+            "span",
+            sum.span
+                .map(|(a, b)| format!("{} → {}", fmt_unix(a), fmt_unix(b)))
+                .unwrap_or_else(|| "no samples yet".into()),
+        ));
+        lines.push(Line::raw(""));
+
+        let name_w = w.saturating_sub(48).clamp(8, 40);
+        lines.push(Line::styled(
+            truncate(
+                &format!(
+                    " {:<name_w$} {:>6} {:>10} {:>11} {:>8}",
+                    "MODEL", "REQS", "TOKENS", "DECODE t/s", "TTFT"
+                ),
+                w,
+            ),
+            head,
+        ));
+        if sum.models.is_empty() {
+            lines.push(Line::styled(" no finished requests logged yet", dim));
+        }
+        for m in &sum.models {
+            lines.push(Line::styled(
+                truncate(
+                    &format!(
+                        " {:<name_w$} {:>6} {:>10} {:>11} {:>8}",
+                        truncate(&m.model, name_w),
+                        fmt_int(m.requests as usize),
+                        fmt_int(m.decoded as usize),
+                        m.avg_decode_tps
+                            .map(|v| fmt_rate(v as f32))
+                            .unwrap_or_else(|| "–".into()),
+                        m.avg_ttft_s
+                            .map(|s| fmt_dur(Duration::from_secs_f64(s.max(0.0))))
+                            .unwrap_or_else(|| "–".into()),
+                    ),
+                    w,
+                ),
+                text,
+            ));
+        }
+        lines.push(Line::raw(""));
+
+        let name_w = w.saturating_sub(62).clamp(8, 40);
+        lines.push(Line::styled(
+            truncate(
+                &format!(
+                    " {:<14} {:<name_w$} {:>7} {:>7} {:>8} {:>8} {:>8}",
+                    "ENDED", "MODEL", "PROMPT", "OUT", "TTFT", "TIME", "t/s"
+                ),
+                w,
+            ),
+            head,
+        ));
+        // The newest requests that fit above the key row.
+        let room = h.saturating_sub(lines.len() + 2);
+        for r in sum.recent.iter().take(room) {
+            lines.push(Line::styled(
+                truncate(
+                    &format!(
+                        " {:<14} {:<name_w$} {:>7} {:>7} {:>8} {:>8} {:>8}",
+                        fmt_unix(r.ended_ts),
+                        truncate(&r.model, name_w),
+                        fmt_int(r.prompt_tokens as usize),
+                        fmt_int(r.decoded as usize),
+                        r.ttft_s
+                            .map(|s| fmt_dur(Duration::from_secs_f64(s.max(0.0))))
+                            .unwrap_or_else(|| "–".into()),
+                        fmt_dur(Duration::from_secs_f64(r.duration_s.max(0.0))),
+                        fmt_rate(r.avg_decode_tps as f32),
+                    ),
+                    w,
+                ),
+                text,
+            ));
+        }
+        while lines.len() + 1 < h {
+            lines.push(Line::raw(""));
+        }
+        lines.push(keys);
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+/// "900", "1.5k", "12.3k" tokens.
+fn fmt_tokens(n: i64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+impl Renderer {
+    fn render_ctx_speed(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        speeds: &Result<Vec<ContextSpeed>, String>,
+        sel: usize,
+    ) {
+        let width = area.width.saturating_sub(4).min(100);
+        let height = area.height.saturating_sub(2).min(26);
+        let rect = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, rect);
+        let block = panel(" ◆ DECODE SPEED vs CONTEXT ", pal::CYAN);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let w = inner.width as usize;
+        let h = inner.height as usize;
+        let text = Style::default().fg(pal::c(pal::TEXT));
+        let dim = Style::default().fg(pal::c(pal::TEXT_DIM));
+        let head = Style::default()
+            .fg(pal::c(pal::accent(pal::CYAN)))
+            .add_modifier(Modifier::BOLD);
+        let key = |k: &'static str, label: &'static str| {
+            [
+                Span::styled(k, text.add_modifier(Modifier::BOLD)),
+                Span::styled(label, dim),
+            ]
+        };
+        let mut hint: Vec<Span<'static>> = Vec::new();
+        if speeds.as_ref().is_ok_and(|v| v.len() > 1) {
+            hint.extend(key(" ←→", " model "));
+        }
+        hint.extend(key(" r", " refresh "));
+        hint.extend(key(" esc", " close "));
+        let keys = Line::from(fit_spans(&hint, w));
+
+        let mut lines: Vec<Line> = Vec::new();
+        let m = match speeds {
+            Ok(v) if !v.is_empty() => &v[sel.min(v.len() - 1)],
+            Ok(_) | Err(_) => {
+                let (msg, style) = match speeds {
+                    Err(e) => (e.clone(), Style::default().fg(pal::c(pal::MAGENTA))),
+                    _ => ("no decode samples logged yet".into(), text),
+                };
+                lines.push(Line::styled(truncate(&format!(" {msg}"), w), style));
+                lines.push(Line::styled(
+                    truncate(
+                        " Built from the --log-db samples taken while a model decodes.",
+                        w,
+                    ),
+                    dim,
+                ));
+                lines.push(Line::raw(""));
+                lines.push(keys);
+                frame.render_widget(Paragraph::new(lines), inner);
+                return;
+            }
+        };
+        let count = speeds.as_ref().map_or(1, |v| v.len());
+        lines.push(Line::from(vec![
+            Span::styled(" model ", dim),
+            Span::styled(
+                truncate(&m.model, w.saturating_sub(16)),
+                text.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}/{count}", sel.min(count - 1) + 1), dim),
+        ]));
+        lines.push(Line::styled(
+            truncate(
+                &format!(
+                    " mean decode tok/s per {} tokens of context, {} samples",
+                    fmt_tokens(m.step),
+                    fmt_int(m.samples as usize)
+                ),
+                w,
+            ),
+            dim,
+        ));
+        lines.push(Line::raw(""));
+
+        let label_w = 14;
+        let bar_w = w.saturating_sub(label_w + 8 + 9 + 3);
+        lines.push(Line::styled(
+            truncate(
+                &format!(
+                    " {:<label_w$} {:<bar_w$} {:>8} {:>8}",
+                    "CONTEXT", "", "t/s", "SAMPLES"
+                ),
+                w,
+            ),
+            head,
+        ));
+        let peak = m.buckets.iter().map(|b| b.1).fold(0.0, f64::max);
+        let (first, last) = (m.buckets[0].0, m.buckets[m.buckets.len() - 1].0);
+        // Every row from the shortest to the longest context, empty ones too,
+        // so the vertical axis stays linear in tokens.
+        let mut start = first;
+        // Leave a blank line, the summary and the key row below.
+        while start <= last && lines.len() + 3 < h {
+            let range = format!("{}–{}", fmt_tokens(start), fmt_tokens(start + m.step));
+            let mut spans = vec![Span::styled(format!(" {range:<label_w$} "), text)];
+            match m.buckets.iter().find(|b| b.0 == start) {
+                Some(&(_, tps, n)) => {
+                    spans.extend(gauge((tps / peak) as f32, None, bar_w, GaugeStyle::Flow));
+                    // A handful of samples is a noisy mean; say so by dimming.
+                    let st = if n < 5 { dim } else { text };
+                    spans.push(Span::styled(format!(" {:>8}", fmt_rate(tps as f32)), st));
+                    spans.push(Span::styled(format!(" {:>8}", fmt_int(n as usize)), dim));
+                }
+                None => spans.push(Span::styled(format!("{:>w2$}", "–", w2 = bar_w + 9), dim)),
+            }
+            lines.push(Line::from(fit_spans(&spans, w)));
+            start += m.step;
+        }
+        lines.push(Line::raw(""));
+        let (lo, hi) = (m.buckets[0].1, m.buckets[m.buckets.len() - 1].1);
+        if m.buckets.len() > 1 && lo > 0.0 {
+            lines.push(Line::from(vec![
+                Span::styled(" shortest → longest context ", dim),
+                Span::styled(
+                    format!(
+                        "{} → {} t/s ({:+.0}%)",
+                        fmt_rate(lo as f32),
+                        fmt_rate(hi as f32),
+                        (hi / lo - 1.0) * 100.0
+                    ),
+                    text.add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        while lines.len() + 1 < h {
+            lines.push(Line::raw(""));
+        }
+        lines.push(keys);
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -2130,7 +2715,11 @@ impl Renderer {
                 area.width.saturating_sub(8) as usize
             )
         );
-        let accent = if focused { pal::CYAN } else { pal::BORDER };
+        let accent = if focused {
+            pal::accent(pal::CYAN)
+        } else {
+            pal::chrome().border
+        };
         let mut block = panel(&title, if focused { pal::WHITE } else { pal::TEXT_DIM });
         if focused {
             block = block.border_style(Style::default().fg(pal::c(accent)));
@@ -2516,7 +3105,7 @@ impl Renderer {
             } else if d.gpus.is_empty() {
                 Some("no GPU".into())
             } else if !host.pcie_ok {
-                Some("nvidia-smi dmon\nunavailable".into())
+                Some("PCIe throughput\nunavailable".into())
             } else {
                 None
             },
@@ -2953,12 +3542,12 @@ fn panel(title: &str, accent: (u8, u8, u8)) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(pal::c(pal::BORDER)))
-        .style(Style::default().bg(pal::c(pal::BG)))
+        .border_style(Style::default().fg(pal::c(pal::chrome().border)))
+        .style(Style::default().bg(pal::c(pal::chrome().bg)))
         .title(Span::styled(
             title.to_string(),
             Style::default()
-                .fg(pal::c(accent))
+                .fg(pal::c(pal::accent(accent)))
                 .add_modifier(Modifier::BOLD),
         ))
         .title_alignment(Alignment::Left)
@@ -2991,13 +3580,16 @@ fn gauge(frac: f32, peak: Option<f32>, width: usize, style: GaugeStyle) -> Vec<S
                     "▌",
                     Style::default()
                         .fg(pal::c(pal::WHITE))
-                        .bg(pal::c(pal::TRACK)),
+                        .bg(pal::c(pal::chrome().track)),
                 );
             }
             match filled {
                 2 => Span::styled("█", Style::default().fg(col)),
-                1 => Span::styled("▌", Style::default().fg(col).bg(pal::c(pal::TRACK))),
-                _ => Span::styled("█", Style::default().fg(pal::c(pal::TRACK))),
+                1 => Span::styled(
+                    "▌",
+                    Style::default().fg(col).bg(pal::c(pal::chrome().track)),
+                ),
+                _ => Span::styled("█", Style::default().fg(pal::c(pal::chrome().track))),
             }
         })
         .collect()
@@ -3024,7 +3616,7 @@ fn vmeter(frac: f32, hold: f32, height: usize, width: usize) -> Vec<Vec<Span<'st
             let e = total.saturating_sub(from_bottom * 8).min(8);
             let pos = (from_bottom as f32 + 0.5) / height as f32;
             let col = pal::vu(pos);
-            let track = Style::default().bg(pal::c(pal::TRACK));
+            let track = Style::default().bg(pal::c(pal::chrome().track));
             let span = if hold_row == Some(r) && e < 8 {
                 Span::styled("▔".repeat(width), track.fg(pal::c(pal::WHITE)))
             } else if e == 8 {
@@ -3098,7 +3690,7 @@ fn vram_bar(
     (0..n)
         .map(|x| {
             let (ch, rgb) = if x >= used_n {
-                ("█", pal::TRACK)
+                ("█", pal::chrome().track)
             } else if x < w_n {
                 let t = x as f32 / w_n.max(1) as f32;
                 ("█", pal::lerp_rgb(pal::BLUE, pal::VIOLET, t))
@@ -3118,9 +3710,74 @@ fn vram_bar(
             } else {
                 ("█", pal::dim_rgb(pal::AMBER, 0.7))
             };
-            Span::styled(ch, Style::default().fg(pal::c(rgb)).bg(pal::c(pal::TRACK)))
+            Span::styled(
+                ch,
+                Style::default()
+                    .fg(pal::c(rgb))
+                    .bg(pal::c(pal::chrome().track)),
+            )
         })
         .collect()
+}
+
+/// System RAM: in-use cells coloured by position like a VU gauge, then the
+/// reclaimable page cache, then free.
+fn ram_bar(width: usize, used: f32, cache: f32) -> Vec<Span<'static>> {
+    let n = width.max(1);
+    let used_n = ((used.clamp(0.0, 1.0) * n as f32).round() as usize).min(n);
+    let cache_n = ((cache.clamp(0.0, 1.0) * n as f32).round() as usize).min(n - used_n);
+    let track = pal::c(pal::chrome().track);
+    (0..n)
+        .map(|x| {
+            let (ch, fg) = if x < used_n {
+                ("█", pal::vu((x as f32 + 0.5) / n as f32))
+            } else if x < used_n + cache_n {
+                ("▒", pal::c(pal::dim_rgb(pal::VIOLET, 0.7)))
+            } else {
+                ("█", track)
+            };
+            Span::styled(ch, Style::default().fg(fg).bg(track))
+        })
+        .collect()
+}
+
+/// Rows the system RAM section takes at the foot of the GPU panel: a rule,
+/// the bar and at least one history row when the cards keep three rows
+/// each, the bar alone when they keep two, nothing below that. Spare height
+/// is shared with the cards so a tall panel grows the history too.
+fn ram_rows(h: u16, n_gpus: u16, d: &Dashboard) -> u16 {
+    if d.perf.bw.host.mem_total_bytes.is_none() || d.perf.bw.host.mem_available_bytes.is_none() {
+        0
+    } else if h >= 3 * n_gpus + 3 {
+        let extra = (h - 3 * n_gpus - 3) / (n_gpus + 1);
+        3 + extra.min(3)
+    } else if h > 2 * n_gpus {
+        1
+    } else {
+        0
+    }
+}
+
+/// Splits the GPUs panel's `h` rows between `n` cards and the RAM section
+/// (`ram_h` rows, from `ram_rows`). Returns the card heights, the final RAM
+/// height, and whether a blank line follows each card (between cards and
+/// above RAM). The blank lines go in only when every card still keeps its
+/// three rows, so a sparkline never pays for one.
+fn gpu_split(h: u16, n: u16, mut ram_h: u16) -> (Vec<u16>, u16, bool) {
+    let n = n.max(1);
+    let cards_h = h.saturating_sub(ram_h);
+    let gaps = n - 1 + u16::from(ram_h > 0);
+    let gap = gaps > 0 && cards_h >= 3 * n + gaps;
+    let mut avail = cards_h - if gap { gaps } else { 0 };
+    // Rows the cards cannot split evenly go to the RAM history.
+    if ram_h >= 3 {
+        ram_h += avail % n;
+        avail -= avail % n;
+    }
+    let cards = (0..n)
+        .map(|i| avail / n + u16::from(i < avail % n))
+        .collect();
+    (cards, ram_h, gap)
 }
 
 /// Multi-row bar sparkline; newest sample at the right edge. Colour by level.
@@ -3131,6 +3788,9 @@ fn sparkline(
     max: f32,
     grad: &[(f32, (u8, u8, u8))],
 ) -> Vec<Vec<Span<'static>>> {
+    if pal::chrome().braille {
+        return braille_sparkline(values, width, rows, max, grad);
+    }
     let rows = rows.max(1);
     let max = max.max(1e-3);
     let n = values.len();
@@ -3157,7 +3817,7 @@ fn sparkline(
             let e = total.saturating_sub(from_bottom * 8).min(8);
             let span = if e == 0 {
                 if from_bottom == 0 {
-                    Span::styled("▁", Style::default().fg(pal::c(pal::TRACK)))
+                    Span::styled("▁", Style::default().fg(pal::c(pal::chrome().track)))
                 } else {
                     Span::raw(" ")
                 }
@@ -3166,6 +3826,59 @@ fn sparkline(
                 Span::styled(ch, Style::default().fg(col))
             };
             out[r].push(span);
+        }
+    }
+    out
+}
+
+/// `sparkline` in braille: each cell carries two samples side by side and
+/// four dots of height per row, filled from the foot like btop's graphs.
+fn braille_sparkline(
+    values: &[f32],
+    width: usize,
+    rows: usize,
+    max: f32,
+    grad: &[(f32, (u8, u8, u8))],
+) -> Vec<Vec<Span<'static>>> {
+    // Dot bits of the left and right columns, bottom dot first.
+    const LEFT: [u32; 4] = [0x40, 0x04, 0x02, 0x01];
+    const RIGHT: [u32; 4] = [0x80, 0x20, 0x10, 0x08];
+    let rows = rows.max(1);
+    let max = max.max(1e-3);
+    let n = values.len();
+    let start = n.saturating_sub(width * 2);
+    let pad = (width * 2).saturating_sub(n);
+    let sample = |i: usize| {
+        (i >= pad)
+            .then(|| values[start + i - pad])
+            .filter(|v| !v.is_nan())
+    };
+    let dots = |v: f32| ((v / max).clamp(0.0, 1.0) * rows as f32 * 4.0).round() as usize;
+    let track = Style::default().fg(pal::c(pal::chrome().track));
+    let mut out: Vec<Vec<Span<'static>>> = vec![Vec::with_capacity(width); rows];
+    for x in 0..width {
+        let (l, r) = (sample(2 * x), sample(2 * x + 1));
+        if l.is_none() && r.is_none() {
+            for row in out.iter_mut() {
+                row.push(Span::raw(" "));
+            }
+            continue;
+        }
+        let (hl, hr) = (l.map_or(0, dots), r.map_or(0, dots));
+        let top = l.unwrap_or(0.0).max(r.unwrap_or(0.0));
+        let col = pal::gradient_color(grad, (top / max).clamp(0.0, 1.0));
+        for (ri, row) in out.iter_mut().enumerate() {
+            let from_bottom = rows - 1 - ri;
+            let fill = |h: usize| h.saturating_sub(from_bottom * 4).min(4);
+            let bits: u32 = LEFT[..fill(hl)].iter().chain(&RIGHT[..fill(hr)]).sum();
+            row.push(if bits == 0 && from_bottom == 0 {
+                Span::styled("⣀", track)
+            } else if bits == 0 {
+                Span::raw(" ")
+            } else {
+                let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
+                Span::styled(ch.to_string(), Style::default().fg(col))
+            });
         }
     }
     out
@@ -3321,6 +4034,44 @@ fn cmd_arg(cmdline: &str, key: &str) -> Option<String> {
 }
 
 /// Quantisation tag from the GGUF file name, e.g. "Q3_K_XL", "Q4_K_M", "IQ4_XS".
+/// Where a loaded vision encoder runs, as ("G1 RTX 3070", Some("CUDA0")):
+/// the host card in the GPU panel's numbering, then the engine's own name
+/// for the device when it has one. `None` when nothing is loaded.
+fn vision_label(v: &Vision, gpus: &[GpuStats]) -> Option<(String, Option<String>)> {
+    if !v.is_loaded() {
+        return None;
+    }
+    let card = |i: u32| match gpus.iter().find(|g| g.index == i) {
+        Some(g) => format!("G{i} {}", g.short_name()),
+        None => format!("G{i}"),
+    };
+    Some(match &v.place {
+        Place::Cpu => ("CPU".into(), None),
+        Place::Gpu {
+            device,
+            gpu: Some(i),
+        } => (card(*i), device.clone()),
+        Place::Gpu {
+            device: Some(dev),
+            gpu: None,
+        } => (dev.clone(), None),
+        Place::Gpu {
+            device: None,
+            gpu: None,
+        } => ("GPU".into(), None),
+        Place::Gpus(ids) if ids.len() == 1 => (card(ids[0]), None),
+        Place::Gpus(ids) if !ids.is_empty() => (
+            ids.iter()
+                .map(|i| format!("G{i}"))
+                .collect::<Vec<_>>()
+                .join("+"),
+            None,
+        ),
+        Place::Gpus(_) => ("GPU".into(), None),
+        Place::Unknown => ("loaded".into(), None),
+    })
+}
+
 fn quant_from_path(m: &DetectedModel) -> Option<String> {
     let stem = m.path.as_ref()?.file_stem()?.to_string_lossy().to_string();
     let is_quant = |t: &str| {
@@ -3351,6 +4102,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpu_split_keeps_three_rows_per_card_before_adding_gaps() {
+        for n in [1u16, 2, 3, 4, 8] {
+            for h in 0..60u16 {
+                // RAM sizes ram_rows can hand out: none, compact, multi-row.
+                for ram in [0u16, 1, 3, 5] {
+                    if ram > h || (ram >= 3 && h < 3 * n + 3) {
+                        continue;
+                    }
+                    let (cards, ram_h, gap) = gpu_split(h, n, ram);
+                    let gaps = if gap { n - 1 + u16::from(ram_h > 0) } else { 0 };
+                    let used: u16 = cards.iter().sum::<u16>() + ram_h + gaps;
+                    assert!(used <= h, "n={n} h={h} ram={ram}: {used} rows > {h}");
+                    if gap {
+                        assert!(
+                            cards.iter().all(|&c| c >= 3),
+                            "n={n} h={h} ram={ram}: {cards:?}"
+                        );
+                    }
+                    if ram >= 3 {
+                        assert!(cards.iter().all(|&c| c == cards[0]), "uneven {cards:?}");
+                    }
+                }
+            }
+        }
+        // Two cards, 10 rows, RAM 3: no room for gaps, so both cards keep 3 rows.
+        assert_eq!(gpu_split(10, 2, 3), (vec![3, 3], 4, false));
+        // Two cards, budgeted 12 rows, RAM 4: gaps fit alongside 3-row cards.
+        assert_eq!(gpu_split(12, 2, 4), (vec![3, 3], 4, true));
+        // Two cards, 8 rows, compact RAM: no gap rather than a 3/2 split.
+        assert_eq!(gpu_split(8, 2, 1), (vec![4, 3], 1, false));
+    }
+
+    #[test]
     fn gauge_uses_position_colours_and_peak() {
         let bar = gauge(1.0, None, 20, GaugeStyle::Vu);
         assert_eq!(bar.len(), 20);
@@ -3373,6 +4157,23 @@ mod tests {
         // Half-height sample fills only the bottom row.
         assert_eq!(rows[0][3].content, " ");
         assert_eq!(rows[1][3].content, "█");
+    }
+
+    #[test]
+    fn braille_sparkline_packs_two_samples_per_cell() {
+        pal::set_chrome(pal::get_theme("braille").chrome);
+        // Cells: [pad, pad], [0, 50], [100, 25].
+        let rows = sparkline(&[0.0, 50.0, 100.0, 25.0], 3, 2, 100.0, pal::FLOW);
+        pal::set_chrome(pal::get_theme("defrag").chrome);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(rows[1][0].content, " ");
+        // 0 and 50 of 8 dots: left empty, right full in the bottom row only.
+        assert_eq!(rows[0][1].content, " ");
+        assert_eq!(rows[1][1].content, "⢸");
+        // 100 fills the left column in both rows; 25 is two dots on the right.
+        assert_eq!(rows[0][2].content, "⡇");
+        assert_eq!(rows[1][2].content, "⣧");
     }
 
     #[test]

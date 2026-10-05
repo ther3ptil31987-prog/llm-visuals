@@ -13,6 +13,7 @@ use crate::gpu::{DemoGpu, GpuSample, GpuStats};
 use crate::host::HostSample;
 use crate::model_detect::DetectedModel;
 use crate::observe::{ExpertLayer, ExpertStats, LiveStats, SpecMetrics};
+use crate::vision::{Place, Vision};
 
 /// How one synthetic server behaves: its shape on paper and its speed.
 struct DemoProfile {
@@ -32,6 +33,8 @@ struct DemoProfile {
     mem_used_mb: u64,
     gpus: &'static [u32],
     tensor_split: &'static [f32],
+    /// Vision projector: ggml device name ("CPU" for none) and host GPU.
+    vision: Option<(&'static str, Option<u32>)>,
     /// Decode tokens/s and prefill tokens/s the profile settles around.
     decode_tps: f32,
     prefill_tps: f32,
@@ -56,6 +59,7 @@ const PROFILES: &[DemoProfile] = &[
         mem_used_mb: 18_900,
         gpus: &[0, 1],
         tensor_split: &[63.0, 37.0],
+        vision: Some(("CUDA1", Some(0))),
         decode_tps: 48.0,
         prefill_tps: 1150.0,
         ctx_frac: 1.0,
@@ -77,6 +81,7 @@ const PROFILES: &[DemoProfile] = &[
         mem_used_mb: 6_400,
         gpus: &[0],
         tensor_split: &[],
+        vision: None,
         decode_tps: 92.0,
         prefill_tps: 2600.0,
         ctx_frac: 0.25,
@@ -98,6 +103,7 @@ const PROFILES: &[DemoProfile] = &[
         mem_used_mb: 2_100,
         gpus: &[1],
         tensor_split: &[],
+        vision: Some(("CPU", None)),
         decode_tps: 165.0,
         prefill_tps: 5200.0,
         ctx_frac: 0.12,
@@ -119,6 +125,7 @@ const PROFILES: &[DemoProfile] = &[
         mem_used_mb: 21_800,
         gpus: &[0, 1],
         tensor_split: &[50.0, 50.0],
+        vision: None,
         decode_tps: 31.0,
         prefill_tps: 780.0,
         ctx_frac: 0.5,
@@ -148,6 +155,7 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
         engine: "llama.cpp".into(),
         gpu_indices: p.gpus.to_vec(),
         mem_used_mb: p.mem_used_mb,
+        host: "127.0.0.1".into(),
         port: Some(8080 + idx as u16),
         ctx_max: Some(ctx),
         spec_type: if p.n_mtp > 0 {
@@ -179,6 +187,16 @@ fn demo_model_n(ctx_max: usize, idx: usize) -> DetectedModel {
             engram_bytes: 0,
             block_bytes: vec![p.file_bytes / p.n_layers as u64; p.n_layers],
             n_tensors: 753,
+        }),
+        vision: p.vision.map(|(device, gpu)| Vision {
+            loaded: Some(true),
+            place: match device {
+                "CPU" => Place::Cpu,
+                dev => Place::Gpu {
+                    device: Some(dev.into()),
+                    gpu,
+                },
+            },
         }),
     }
 }
@@ -509,7 +527,8 @@ impl DemoExperts {
 
 /// Host counters for the demo: a page-cache miss burst on cold requests,
 /// PCIe traffic proportional to load (the second card holds offloaded
-/// layers so it sees more), and a fixed resident set.
+/// layers so it sees more), a fixed resident set, and system RAM that
+/// climbs with load (activations, prompt buffers) and eases back at idle.
 struct DemoHost {
     n_gpus: usize,
     seed: u64,
@@ -517,6 +536,8 @@ struct DemoHost {
     proc_bytes: u64,
     majflt: u64,
     cold_ticks: u32,
+    /// Bytes in use beyond the baseline, eased toward a load-driven target.
+    ram_extra: f32,
 }
 
 impl DemoHost {
@@ -528,6 +549,7 @@ impl DemoHost {
             proc_bytes: 2_000_000_000,
             majflt: 1200,
             cold_ticks: 0,
+            ram_extra: 0.0,
         }
     }
 
@@ -556,6 +578,9 @@ impl DemoHost {
                 (i as u32, rx, rx * 0.12)
             })
             .collect();
+        let target = 6e9 * load + 0.6e9 * jitter;
+        self.ram_extra += (target - self.ram_extra) * 0.08;
+        let extra = self.ram_extra.max(0.0) as u64;
         HostSample {
             disk_read_bytes: Some(self.disk_bytes),
             proc_read_bytes: Some(self.proc_bytes),
@@ -563,7 +588,7 @@ impl DemoHost {
             rss_file_bytes: Some(6_100_000_000),
             rss_bytes: Some(7_300_000_000),
             mem_total_bytes: Some(64_000_000_000),
-            mem_available_bytes: Some(41_000_000_000),
+            mem_available_bytes: Some(41_000_000_000 - extra),
             page_cache_bytes: Some(22_000_000_000),
             pcie_mb_s,
             pcie_ok: true,

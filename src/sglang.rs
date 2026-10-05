@@ -16,12 +16,13 @@
 //! batch after idle is skipped, and cache hits are unknown (shown as "—"
 //! rather than 0).
 
-use crate::observe::{http_get, LiveStats, SpecMetrics};
+use crate::observe::{http_get, HttpAuth, LiveStats, SpecMetrics};
 use serde_json::Value;
 
 /// Static fields from `GET /server_info` (or the older `/get_server_info`).
 #[derive(Debug, Clone, Default)]
 pub struct SglangServerInfo {
+    pub model_path: Option<String>,
     pub context_length: Option<usize>,
     pub speculative_algorithm: Option<String>,
     pub speculative_num_draft_tokens: Option<u32>,
@@ -60,7 +61,11 @@ pub fn parse_server_info(body: &str) -> Option<SglangServerInfo> {
     let algo = json_str(&v, "speculative_algorithm")
         .or_else(|| json_str(&v, "speculative-algorithm"))
         .filter(|s| !s.is_empty() && s != "None" && s != "none" && s != "null");
+    let model_path = json_str(&v, "model_path")
+        .or_else(|| json_str(&v, "model"))
+        .filter(|s| !s.is_empty() && s != "None" && s != "none" && s != "null");
     Some(SglangServerInfo {
+        model_path,
         context_length: json_usize(&v, "context_length")
             .or_else(|| json_usize(&v, "context-length")),
         speculative_algorithm: algo,
@@ -196,9 +201,9 @@ fn json_num(v: &Value) -> Option<f64> {
         .or_else(|| v.as_u64().map(|n| n as f64))
 }
 
-pub async fn poll_server_info(port: u16) -> Option<SglangServerInfo> {
+pub async fn poll_server_info(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangServerInfo> {
     for path in ["/server_info", "/get_server_info"] {
-        if let Ok(body) = http_get("127.0.0.1", port, path).await {
+        if let Ok(body) = http_get(host, port, path, auth).await {
             if let Some(info) = parse_server_info(&body) {
                 return Some(info);
             }
@@ -207,9 +212,9 @@ pub async fn poll_server_info(port: u16) -> Option<SglangServerInfo> {
     None
 }
 
-pub async fn poll_loads(port: u16) -> Option<SglangLoads> {
+pub async fn poll_loads(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangLoads> {
     for path in ["/v1/loads?include=all", "/v1/loads", "/get_load"] {
-        if let Ok(body) = http_get("127.0.0.1", port, path).await {
+        if let Ok(body) = http_get(host, port, path, auth).await {
             if let Some(c) = parse_loads(&body) {
                 return Some(c);
             }
@@ -218,8 +223,8 @@ pub async fn poll_loads(port: u16) -> Option<SglangLoads> {
     None
 }
 
-pub async fn poll_sglang_metrics(port: u16) -> Option<SglangMetrics> {
-    let body = http_get("127.0.0.1", port, "/metrics").await.ok()?;
+pub async fn poll_sglang_metrics(host: &str, port: u16, auth: &HttpAuth) -> Option<SglangMetrics> {
+    let body = http_get(host, port, "/metrics", auth).await.ok()?;
     parse_sglang_metrics(&body)
 }
 
@@ -366,6 +371,7 @@ impl SglangAdapter {
             prompt_tokens,
             prompt_processed,
             decoded,
+            decoded_present: true,
             cache_tokens,
             processing: running,
             spec_types: String::new(),
@@ -467,6 +473,7 @@ mod tests {
     fn parse_server_info_spec_and_ctx() {
         let body = r#"{"context_length":40960,"speculative_algorithm":"EAGLE","speculative_num_draft_tokens":5,"model_path":"/m"}"#;
         let i = parse_server_info(body).unwrap();
+        assert_eq!(i.model_path.as_deref(), Some("/m"));
         assert_eq!(i.context_length, Some(40960));
         assert_eq!(i.speculative_algorithm.as_deref(), Some("EAGLE"));
         assert_eq!(i.speculative_num_draft_tokens, Some(5));

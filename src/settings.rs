@@ -21,7 +21,7 @@ fn env_dir(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn home() -> Option<PathBuf> {
+pub fn home() -> Option<PathBuf> {
     env_dir("HOME").or_else(|| env_dir("USERPROFILE"))
 }
 
@@ -212,7 +212,7 @@ impl SettingsForm {
                 "theme",
                 Kind::Choice(THEME_NAMES),
                 args.theme.clone(),
-                "Colour theme for the heat maps and tiles (also cycled by t)".into(),
+                "Colour theme for panels, heat maps and tiles (also cycled by t)".into(),
             ),
             field(
                 "Colour depth",
@@ -247,7 +247,7 @@ impl SettingsForm {
                 "gpu",
                 Kind::Text,
                 args.gpu.clone(),
-                "all, or comma-separated nvidia-smi indices, e.g. 0,1".into(),
+                "all, or comma-separated GPU indices, e.g. 0,1".into(),
             ),
             field(
                 "SQLite logging",
@@ -292,6 +292,13 @@ impl SettingsForm {
                 Kind::Number,
                 args.max_heads.to_string(),
                 "Heads per layer shown in the attention view; 0 = all".into(),
+            ),
+            field(
+                "Endpoint",
+                "endpoint",
+                Kind::Text,
+                args.endpoint.clone().unwrap_or_default(),
+                "Inference server URL, e.g. http://localhost:7000/v1 (empty for auto)".into(),
             ),
         ];
         // The GPU collector is spawned once with its filter.
@@ -413,12 +420,16 @@ fn merge(
     flags: Vec<(&'static str, String)>,
     defaults: Vec<(&'static str, String)>,
 ) {
-    for ((flag, value), (_, default)) in flags.into_iter().zip(defaults) {
-        if value == default {
-            saved.remove(flag);
-        } else {
-            saved.insert(flag.to_string(), value);
+    let def_map: std::collections::HashMap<&str, &str> =
+        defaults.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for (flag, value) in flags {
+        if let Some(&default) = def_map.get(flag) {
+            if value == default {
+                saved.remove(flag);
+                continue;
+            }
         }
+        saved.insert(flag.to_string(), value);
     }
 }
 
@@ -508,5 +519,30 @@ mod tests {
         assert_eq!(saved.get("theme").map(String::as_str), Some("neon"));
         assert!(!saved.contains_key("poll-ms"));
         assert_eq!(saved.get("model").map(String::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn saving_and_clearing_endpoint_in_settings() {
+        let defaults = SettingsForm::new(&Args::parse_from([APP]));
+        let mut form = SettingsForm::new(&Args::parse_from([APP]));
+        let mut saved = Saved::new();
+
+        // Set an endpoint in settings
+        let ep_idx = form
+            .fields
+            .iter()
+            .position(|f| f.flag == "endpoint")
+            .unwrap();
+        form.fields[ep_idx].value = "http://localhost:7000/v1".into();
+        merge(&mut saved, form.flags(), defaults.flags());
+        assert_eq!(
+            saved.get("endpoint").map(String::as_str),
+            Some("http://localhost:7000/v1")
+        );
+
+        // Clearing endpoint in settings removes it from saved
+        form.fields[ep_idx].value = "".into();
+        merge(&mut saved, form.flags(), defaults.flags());
+        assert!(!saved.contains_key("endpoint"));
     }
 }

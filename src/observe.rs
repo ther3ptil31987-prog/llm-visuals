@@ -1,7 +1,73 @@
 use serde_json::Value;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Optional bearer authentication for inference-server probes.
+/// The token itself never enters clap state, saved settings, or diagnostics.
+#[derive(Clone, Debug, Default)]
+pub struct HttpAuth(Option<Arc<str>>);
+
+impl HttpAuth {
+    pub fn from_key_file(path: Option<&Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read API key file {}: {e}", path.display()))?;
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(format!("API key file {} is empty", path.display()));
+        }
+        if token.contains(['\r', '\n']) {
+            return Err(format!(
+                "API key file {} contains a newline",
+                path.display()
+            ));
+        }
+        Ok(Self(Some(Arc::from(token))))
+    }
+
+    /// A token already in hand (for example `--api-key` on a server cmdline).
+    pub fn from_token(token: Option<String>) -> Self {
+        Self(
+            token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .map(Arc::from),
+        )
+    }
+
+    /// Prefer this key; fall back to `other` when this one is empty.
+    pub fn or(&self, other: &Self) -> Self {
+        if self.0.is_some() {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+
+    fn authorization_header(&self) -> String {
+        self.0
+            .as_deref()
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default()
+    }
+}
+
+fn http_request(host: &str, port: u16, path: &str, auth: &HttpAuth) -> String {
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: application/json, text/plain, */*\r\n{}\r\n",
+        auth.authorization_header()
+    )
+}
 
 /// Live numbers from an inference HTTP API (llama.cpp /slots, etc.).
 #[derive(Debug, Clone, Default)]
@@ -11,6 +77,10 @@ pub struct LiveStats {
     /// Prompt tokens pushed through prefill so far in this request (0 when idle).
     pub prompt_processed: usize,
     pub decoded: usize,
+    /// False when this `/slots` sample omitted `n_decoded`. A missing field
+    /// is not a real zero: recent llama.cpp dev builds leave it out while
+    /// generating, and the poller then uses `tokens_predicted_total`.
+    pub decoded_present: bool,
     pub cache_tokens: usize,
     pub processing: bool,
     pub spec_types: String,
@@ -52,6 +122,49 @@ pub struct LiveStats {
     /// Tokens currently occupying the KV pool (`num_used_tokens`). When
     /// set, `ctx_used` prefers this over prompt+decoded.
     pub kv_tokens: Option<usize>,
+}
+
+/// Per-request decode count when `/slots` does not carry `n_decoded`.
+///
+/// `tokens_predicted_total` is cumulative for the whole server. The base
+/// latched at the start of a request is the previous sample, so `decoded`
+/// counts tokens of this request and keeps rising while it runs. A drop
+/// would look like a new request to the rate window and wipe it.
+#[derive(Debug, Default)]
+pub struct DecodeFallback {
+    base: Option<u64>,
+    last: Option<u64>,
+    prev_processing: bool,
+    prev_task: i64,
+}
+
+impl DecodeFallback {
+    pub fn apply(&mut self, stats: &mut LiveStats, tokens_predicted: u64) {
+        if stats.decoded_present {
+            self.note(stats);
+            return;
+        }
+        let new_request =
+            stats.processing && (!self.prev_processing || stats.id_task != self.prev_task);
+        if new_request {
+            self.base = Some(self.last.unwrap_or(tokens_predicted));
+        }
+        if stats.processing {
+            if let Some(base) = self.base {
+                stats.decoded = tokens_predicted.saturating_sub(base) as usize;
+            }
+        }
+        if !stats.processing {
+            self.base = None;
+        }
+        self.last = Some(tokens_predicted);
+        self.note(stats);
+    }
+
+    fn note(&mut self, stats: &LiveStats) {
+        self.prev_processing = stats.processing;
+        self.prev_task = stats.id_task;
+    }
 }
 
 /// A vLLM request's full counters against the baseline in effect when it
@@ -98,8 +211,8 @@ pub struct SpecMetrics {
     pub tokens_predicted: u64,
 }
 
-pub async fn poll_metrics(port: u16) -> Option<SpecMetrics> {
-    let body = http_get("127.0.0.1", port, "/metrics").await.ok()?;
+pub async fn poll_metrics(host: &str, port: u16, auth: &HttpAuth) -> Option<SpecMetrics> {
+    let body = http_get(host, port, "/metrics", auth).await.ok()?;
     parse_metrics(&body)
 }
 
@@ -165,8 +278,8 @@ impl ExpertStats {
     }
 }
 
-pub async fn poll_experts(port: u16) -> Option<ExpertStats> {
-    let body = http_get("127.0.0.1", port, "/experts").await.ok()?;
+pub async fn poll_experts(host: &str, port: u16, auth: &HttpAuth) -> Option<ExpertStats> {
+    let body = http_get(host, port, "/experts", auth).await.ok()?;
     parse_experts(&body)
 }
 
@@ -216,8 +329,8 @@ pub fn parse_experts(body: &str) -> Option<ExpertStats> {
     })
 }
 
-pub async fn poll_llama(port: u16) -> Option<LiveStats> {
-    let body = http_get("127.0.0.1", port, "/slots").await.ok()?;
+pub async fn poll_llama(host: &str, port: u16, auth: &HttpAuth) -> Option<LiveStats> {
+    let body = http_get(host, port, "/slots", auth).await.ok()?;
     parse_slots(&body)
 }
 
@@ -225,10 +338,12 @@ pub async fn poll_llama(port: u16) -> Option<LiveStats> {
 pub struct LlamaProps {
     pub model_path: String,
     pub model_alias: Option<String>,
+    /// `modalities.vision`: a projector is loaded. Absent on older servers.
+    pub vision: Option<bool>,
 }
 
-pub async fn poll_llama_props(port: u16) -> Option<LlamaProps> {
-    let body = http_get("127.0.0.1", port, "/props").await.ok()?;
+pub async fn poll_llama_props(host: &str, port: u16, auth: &HttpAuth) -> Option<LlamaProps> {
+    let body = http_get(host, port, "/props", auth).await.ok()?;
     parse_llama_props(&body)
 }
 
@@ -241,6 +356,10 @@ pub fn parse_llama_props(body: &str) -> Option<LlamaProps> {
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        vision: v
+            .get("modalities")
+            .and_then(|m| m.get("vision"))
+            .and_then(|x| x.as_bool()),
     })
 }
 
@@ -282,20 +401,21 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let decoded = match slot.get("next_token") {
-        Some(Value::Array(a)) => a
-            .first()
-            .and_then(|t| t.get("n_decoded"))
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as usize,
-        Some(Value::Object(o)) => o.get("n_decoded").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-        _ => 0,
+    // Absent is not zero. Treating a missing `n_decoded` as 0 makes every
+    // decode sample 0 tok/s on builds that stopped sending the field.
+    let decoded_field = match slot.get("next_token") {
+        Some(Value::Array(a)) => a.first().and_then(|t| t.get("n_decoded")),
+        Some(Value::Object(o)) => o.get("n_decoded"),
+        _ => None,
     };
+    let decoded = decoded_field.and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let decoded_present = decoded_field.and_then(|x| x.as_u64()).is_some();
     Some(LiveStats {
         ctx_max: u("n_ctx"),
         prompt_tokens: u("n_prompt_tokens"),
         prompt_processed: u("n_prompt_tokens_processed"),
         decoded,
+        decoded_present,
         cache_tokens: u("n_prompt_tokens_cache"),
         processing,
         spec_types,
@@ -314,24 +434,50 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
     })
 }
 
-pub async fn http_get(host: &str, port: u16, path: &str) -> Result<String, String> {
+#[derive(Debug)]
+pub enum HttpError {
+    ConnectTimeout,
+    Connect(std::io::Error),
+    Write(std::io::Error),
+    ReadTimeout,
+    Read(std::io::Error),
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectTimeout => write!(f, "connect timeout"),
+            Self::Connect(e) => write!(f, "connect error: {e}"),
+            Self::Write(e) => write!(f, "write error: {e}"),
+            Self::ReadTimeout => write!(f, "read timeout"),
+            Self::Read(e) => write!(f, "read error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+pub async fn http_get(
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: &HttpAuth,
+) -> Result<String, HttpError> {
     let connect = TcpStream::connect((host, port));
-    let mut stream = tokio::time::timeout(Duration::from_millis(400), connect)
+    let mut stream = tokio::time::timeout(Duration::from_millis(500), connect)
         .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
-    );
+        .map_err(|_| HttpError::ConnectTimeout)?
+        .map_err(HttpError::Connect)?;
+    let req = http_request(host, port, path, auth);
     stream
         .write_all(req.as_bytes())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(HttpError::Write)?;
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_millis(800), stream.read_to_end(&mut buf))
+    tokio::time::timeout(Duration::from_millis(1500), stream.read_to_end(&mut buf))
         .await
-        .map_err(|_| "read timeout".to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| HttpError::ReadTimeout)?
+        .map_err(HttpError::Read)?;
     let text = String::from_utf8_lossy(&buf);
     let body = text
         .split("\r\n\r\n")
@@ -346,6 +492,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authenticated_request_uses_bearer_header() {
+        let auth = HttpAuth(Some(Arc::from("test-secret")));
+        let request = http_request("127.0.0.1", 11434, "/metrics", &auth);
+        assert!(request.contains("Authorization: Bearer test-secret\r\n"));
+        assert!(request.ends_with("\r\n\r\n"));
+
+        let request = http_request("127.0.0.1", 11434, "/metrics", &HttpAuth::default());
+        assert!(!request.contains("Authorization:"));
+
+        let detected = HttpAuth::from_token(Some("cmdline-key".into()));
+        let file = HttpAuth::from_token(Some("file-key".into()));
+        let request = http_request("127.0.0.1", 8080, "/slots", &detected.or(&file));
+        assert!(request.contains("Authorization: Bearer cmdline-key\r\n"));
+        let request = http_request(
+            "127.0.0.1",
+            8080,
+            "/slots",
+            &HttpAuth::from_token(None).or(&file),
+        );
+        assert!(request.contains("Authorization: Bearer file-key\r\n"));
+    }
+
+    #[test]
     fn parse_llama_slots_sample() {
         let body = r#"[{"id":0,"n_ctx":98304,"speculative":true,"is_processing":false,"id_task":49734,"n_prompt_tokens":2537,"n_prompt_tokens_processed":900,"n_prompt_tokens_cache":100,"params":{"speculative.types":"none,draft-mtp"},"next_token":[{"n_decoded":12}]}]"#;
         let s = parse_slots(body).expect("slots");
@@ -353,12 +522,77 @@ mod tests {
         assert_eq!(s.prompt_tokens, 2537);
         assert_eq!(s.prompt_processed, 900);
         assert_eq!(s.decoded, 12);
+        assert!(s.decoded_present);
         assert_eq!(s.cache_tokens, 100);
         assert_eq!(s.id_task, 49734);
         assert_eq!(s.n_slots, 1);
         assert_eq!(s.slots_busy, 0);
         assert_eq!(s.spec_types, "none,draft-mtp");
         assert!((s.cache_hit_frac() - 100.0 / 2537.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn missing_n_decoded_is_not_a_zero() {
+        let body = r#"[{"id":0,"id_task":7,"is_processing":true,"n_ctx":4096,"n_prompt_tokens":10,"n_prompt_tokens_processed":10,"next_token":[{"id":1}]}]"#;
+        let s = parse_slots(body).expect("slots");
+        assert!(!s.decoded_present);
+        assert_eq!(s.decoded, 0);
+        assert!(s.processing);
+    }
+
+    #[test]
+    fn decode_fallback_counts_tokens_since_the_request_started() {
+        let mut fb = DecodeFallback::default();
+        let mut idle = LiveStats {
+            processing: false,
+            id_task: 1,
+            decoded_present: false,
+            ..LiveStats::default()
+        };
+        fb.apply(&mut idle, 1000);
+        assert_eq!(idle.decoded, 0);
+
+        let mut busy = LiveStats {
+            processing: true,
+            id_task: 2,
+            decoded_present: false,
+            ..LiveStats::default()
+        };
+        fb.apply(&mut busy, 1010);
+        assert_eq!(busy.decoded, 10);
+        fb.apply(&mut busy, 1040);
+        assert_eq!(busy.decoded, 40);
+
+        // A server that still sends n_decoded keeps that number.
+        let mut native = LiveStats {
+            processing: true,
+            id_task: 2,
+            decoded: 7,
+            decoded_present: true,
+            ..LiveStats::default()
+        };
+        fb.apply(&mut native, 9999);
+        assert_eq!(native.decoded, 7);
+
+        // The counter must not step backwards inside one request: a drop
+        // is what makes the rate window throw the sample away.
+        fb.apply(&mut busy, 1055);
+        assert!(busy.decoded >= 40);
+
+        // Attaching mid-request has no earlier sample, so this scrape is
+        // the base and the next one carries the rate. A counter that is
+        // still zero must latch too, or the request never starts counting.
+        let mut mid = DecodeFallback::default();
+        let mut started = LiveStats {
+            processing: true,
+            id_task: 3,
+            decoded_present: false,
+            ..LiveStats::default()
+        };
+        mid.apply(&mut started, 0);
+        assert_eq!(started.decoded, 0);
+        mid.apply(&mut started, 15);
+        assert_eq!(started.decoded, 15);
     }
 
     #[test]
@@ -377,6 +611,18 @@ mod tests {
             Some("ggml-org/Qwen3.8-27B-GGUF:Q4_K_M")
         );
         assert!(parse_llama_props(r#"{"model_alias":"missing-path"}"#).is_none());
+        assert_eq!(props.vision, None);
+    }
+
+    #[test]
+    fn parse_llama_props_vision_modality() {
+        let body = r#"{"model_path":"/m/q.gguf","model_alias":"",
+            "modalities":{"vision":true,"video":false,"audio":false}}"#;
+        let props = parse_llama_props(body).expect("props");
+        assert_eq!(props.vision, Some(true));
+        assert_eq!(props.model_alias, None);
+        let text = r#"{"model_path":"/m/q.gguf","modalities":{"vision":false,"audio":false}}"#;
+        assert_eq!(parse_llama_props(text).unwrap().vision, Some(false));
     }
 
     #[test]

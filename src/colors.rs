@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use ratatui::style::Color;
@@ -127,13 +128,13 @@ pub fn dim_rgb(c: (u8, u8, u8), k: f32) -> (u8, u8, u8) {
 // Dashboard palette
 // ---------------------------------------------------------------------------
 
-pub const BG: (u8, u8, u8) = (13, 15, 22);
-pub const PANEL: (u8, u8, u8) = (18, 21, 30);
-pub const BORDER: (u8, u8, u8) = (52, 58, 78);
+const BG: (u8, u8, u8) = (13, 15, 22);
+const PANEL: (u8, u8, u8) = (18, 21, 30);
+const BORDER: (u8, u8, u8) = (52, 58, 78);
 pub const TEXT: (u8, u8, u8) = (222, 226, 236);
 pub const TEXT_DIM: (u8, u8, u8) = (122, 130, 150);
 pub const TEXT_MUTED: (u8, u8, u8) = (72, 78, 96);
-pub const TRACK: (u8, u8, u8) = (36, 40, 54);
+const TRACK: (u8, u8, u8) = (36, 40, 54);
 
 pub const CYAN: (u8, u8, u8) = (0, 224, 255);
 pub const TEAL: (u8, u8, u8) = (0, 200, 170);
@@ -198,10 +199,52 @@ pub fn c(t: (u8, u8, u8)) -> Color {
 // Themes (activity tile ramps, cycled with `t`)
 // ---------------------------------------------------------------------------
 
+/// The frame colours a theme paints: backgrounds, borders, empty gauge
+/// tracks and panel titles.
+#[derive(Debug, Clone, Copy)]
+pub struct Chrome {
+    pub bg: (u8, u8, u8),
+    pub panel: (u8, u8, u8),
+    pub border: (u8, u8, u8),
+    pub track: (u8, u8, u8),
+    /// Title and highlight colour; `None` keeps each panel's own accent.
+    pub accent: Option<(u8, u8, u8)>,
+    /// Draw history graphs with braille dots (2×4 per cell), as btop does.
+    pub braille: bool,
+}
+
+const DEFRAG_CHROME: Chrome = Chrome {
+    bg: BG,
+    panel: PANEL,
+    border: BORDER,
+    track: TRACK,
+    accent: None,
+    braille: false,
+};
+
+thread_local! {
+    /// The chrome being drawn; the renderer sets it from its theme each frame.
+    static CHROME: Cell<Chrome> = const { Cell::new(DEFRAG_CHROME) };
+}
+
+pub fn chrome() -> Chrome {
+    CHROME.with(Cell::get)
+}
+
+pub fn set_chrome(c: Chrome) {
+    CHROME.with(|cell| cell.set(c));
+}
+
+/// `default`, unless the theme gives every title one accent.
+pub fn accent(default: (u8, u8, u8)) -> (u8, u8, u8) {
+    chrome().accent.unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 pub struct ColorTheme {
     pub name: &'static str,
     pub stops: Vec<(f32, (u8, u8, u8))>,
+    pub chrome: Chrome,
 }
 
 impl ColorTheme {
@@ -218,6 +261,7 @@ pub fn defrag_theme() -> ColorTheme {
     ColorTheme {
         name: "defrag",
         stops: HEAT.to_vec(),
+        chrome: DEFRAG_CHROME,
     }
 }
 
@@ -231,6 +275,14 @@ pub fn neon_theme() -> ColorTheme {
             (0.85, (0, 255, 160)),
             (1.0, (200, 255, 230)),
         ],
+        chrome: Chrome {
+            bg: (14, 8, 22),
+            panel: (22, 12, 34),
+            border: (90, 40, 130),
+            track: (44, 24, 64),
+            accent: Some((255, 60, 225)),
+            braille: false,
+        },
     }
 }
 
@@ -244,6 +296,14 @@ pub fn fire_theme() -> ColorTheme {
             (0.85, (255, 220, 40)),
             (1.0, (255, 255, 210)),
         ],
+        chrome: Chrome {
+            bg: (18, 10, 8),
+            panel: (28, 14, 10),
+            border: (110, 45, 20),
+            track: (54, 28, 20),
+            accent: Some((255, 140, 30)),
+            braille: false,
+        },
     }
 }
 
@@ -257,6 +317,14 @@ pub fn ocean_theme() -> ColorTheme {
             (0.85, (110, 220, 235)),
             (1.0, (220, 250, 255)),
         ],
+        chrome: Chrome {
+            bg: (6, 14, 26),
+            panel: (10, 22, 38),
+            border: (30, 80, 120),
+            track: (20, 42, 64),
+            accent: Some((0, 190, 230)),
+            braille: false,
+        },
     }
 }
 
@@ -270,10 +338,40 @@ pub fn monochrome_theme() -> ColorTheme {
             (0.85, (205, 205, 210)),
             (1.0, (255, 255, 255)),
         ],
+        chrome: Chrome {
+            bg: (14, 14, 16),
+            panel: (22, 22, 26),
+            border: (80, 80, 90),
+            track: (40, 40, 46),
+            accent: Some((225, 225, 232)),
+            braille: false,
+        },
     }
 }
 
-pub const THEME_NAMES: &[&str] = &["defrag", "neon", "fire", "ocean", "monochrome"];
+/// btop's look: braille graphs, green → yellow → red heat, grey frames.
+pub fn braille_theme() -> ColorTheme {
+    ColorTheme {
+        name: "braille",
+        stops: vec![
+            (0.0, (16, 20, 18)),
+            (0.3, (40, 120, 80)),
+            (0.6, (80, 240, 149)),
+            (0.85, (242, 226, 102)),
+            (1.0, (250, 30, 30)),
+        ],
+        chrome: Chrome {
+            bg: (10, 10, 10),
+            panel: (20, 20, 20),
+            border: (64, 64, 64),
+            track: (34, 34, 34),
+            accent: Some((80, 240, 149)),
+            braille: true,
+        },
+    }
+}
+
+pub const THEME_NAMES: &[&str] = &["defrag", "neon", "fire", "ocean", "monochrome", "braille"];
 
 pub fn get_theme(name: &str) -> ColorTheme {
     match name.to_lowercase().as_str() {
@@ -281,6 +379,7 @@ pub fn get_theme(name: &str) -> ColorTheme {
         "fire" => fire_theme(),
         "ocean" => ocean_theme(),
         "mono" | "monochrome" => monochrome_theme(),
+        "braille" | "btop" => braille_theme(),
         _ => defrag_theme(),
     }
 }
@@ -315,8 +414,20 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_but_defrag_recolours_titles() {
+        for name in THEME_NAMES {
+            let t = get_theme(name);
+            assert_eq!(t.chrome.accent.is_none(), *name == "defrag", "{name}");
+        }
+        set_chrome(get_theme("fire").chrome);
+        assert_eq!(accent(CYAN), (255, 140, 30));
+        set_chrome(DEFRAG_CHROME);
+        assert_eq!(accent(CYAN), CYAN);
+    }
+
+    #[test]
     fn theme_cycle_wraps() {
-        assert_eq!(next_theme_name("monochrome"), "defrag");
+        assert_eq!(next_theme_name("braille"), "defrag");
         assert_eq!(next_theme_name("defrag"), "neon");
     }
 }

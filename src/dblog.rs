@@ -4,9 +4,9 @@
 use crate::gpu::GpuStats;
 use crate::model_detect::DetectedModel;
 use crate::perf::PerfTracker;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "
@@ -179,6 +179,185 @@ impl DbLog {
     }
 }
 
+/// Per-model totals over every logged request.
+pub struct ModelTotals {
+    pub model: String,
+    pub requests: i64,
+    pub decoded: i64,
+    /// Mean of the requests that decoded at a measurable rate.
+    pub avg_decode_tps: Option<f64>,
+    pub avg_ttft_s: Option<f64>,
+}
+
+pub struct LoggedRequest {
+    pub ended_ts: f64,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub decoded: i64,
+    pub ttft_s: Option<f64>,
+    pub duration_s: f64,
+    pub avg_decode_tps: f64,
+}
+
+/// What the log viewer (`l`) shows of a log database.
+pub struct LogSummary {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub counts: Vec<(&'static str, i64)>,
+    /// First and last sample, unix seconds.
+    pub span: Option<(f64, f64)>,
+    pub models: Vec<ModelTotals>,
+    /// Newest first.
+    pub recent: Vec<LoggedRequest>,
+}
+
+fn open_read_only(path: &Path) -> Result<Connection, String> {
+    let err = |e: rusqlite::Error| format!("{}: {e}", path.display());
+    // Open fails on a missing file instead of creating it.
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    conn.busy_timeout(std::time::Duration::from_millis(100))
+        .map_err(err)?;
+    Ok(conn)
+}
+
+/// Rows the context-speed screen (`c`) aims for per model.
+const CTX_ROWS: i64 = 12;
+/// Tokens per bucket of the one grouping query; screen rows merge these.
+const CTX_GRAIN: i64 = 256;
+
+/// Mean decode rate against context length for one model.
+pub struct ContextSpeed {
+    pub model: String,
+    pub samples: i64,
+    /// Tokens covered by each bucket.
+    pub step: i64,
+    /// (first token of the bucket, mean decode tok/s, samples), ascending by
+    /// context; buckets with no samples are left out.
+    pub buckets: Vec<(i64, f64, i64)>,
+}
+
+/// Decode rate by context length, per model, from the samples taken while
+/// the model was decoding and not also prefilling (a sample straddling the
+/// two reads a partly empty window). Most-sampled model first.
+pub fn context_speed(path: &Path) -> Result<Vec<ContextSpeed>, String> {
+    let conn = open_read_only(path)?;
+    // One scan of the table; the fine buckets are merged below.
+    let rows: Vec<(String, i64, f64, i64)> = conn
+        .prepare(&format!(
+            "SELECT model, ctx_used / {CTX_GRAIN}, SUM(decode_tps), COUNT(*) FROM model_samples \
+             WHERE processing = 1 AND decode_tps > 0 AND prefill_tps = 0 AND ctx_used > 0 \
+             GROUP BY 1, 2 ORDER BY 1, 2"
+        ))
+        .and_then(|mut q| {
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect()
+        })
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out: Vec<ContextSpeed> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        // Rows are ordered by model; `group` is one model's run.
+        let end = rows[i..]
+            .iter()
+            .position(|r| r.0 != rows[i].0)
+            .map_or(rows.len(), |k| i + k);
+        let group = &rows[i..end];
+        i = end;
+        let (lo, hi) = (group[0].1, group[group.len() - 1].1);
+        let per = (hi - lo) / CTX_ROWS + 1; // fine buckets per screen row
+        let mut buckets: Vec<(i64, f64, i64)> = Vec::new();
+        for &(_, fine, sum, n) in group {
+            let start = (lo + (fine - lo) / per * per) * CTX_GRAIN;
+            match buckets.last_mut() {
+                Some(b) if b.0 == start => {
+                    b.1 += sum;
+                    b.2 += n;
+                }
+                _ => buckets.push((start, sum, n)),
+            }
+        }
+        for b in &mut buckets {
+            b.1 /= b.2 as f64;
+        }
+        out.push(ContextSpeed {
+            model: group[0].0.clone(),
+            samples: group.iter().map(|g| g.3).sum(),
+            step: per * CTX_GRAIN,
+            buckets,
+        });
+    }
+    out.sort_by_key(|m| std::cmp::Reverse(m.samples));
+    Ok(out)
+}
+
+/// Read a log database without writing to it, so a file another dashboard
+/// is logging to can be viewed too.
+pub fn summarize(path: &Path) -> Result<LogSummary, String> {
+    let err = |e: rusqlite::Error| format!("{}: {e}", path.display());
+    let bytes = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    let conn = open_read_only(path)?;
+    let mut counts = Vec::new();
+    for t in TABLES {
+        let n = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+            .map_err(err)?;
+        counts.push((t, n));
+    }
+    let (first, last): (Option<f64>, Option<f64>) = conn
+        .query_row("SELECT MIN(ts), MAX(ts) FROM model_samples", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map_err(err)?;
+    let models = conn
+        .prepare(
+            "SELECT model, COUNT(*), SUM(decoded), AVG(NULLIF(avg_decode_tps, 0)), AVG(ttft_s) \
+             FROM requests GROUP BY model ORDER BY COUNT(*) DESC LIMIT 8",
+        )
+        .and_then(|mut q| {
+            q.query_map([], |r| {
+                Ok(ModelTotals {
+                    model: r.get(0)?,
+                    requests: r.get(1)?,
+                    decoded: r.get(2)?,
+                    avg_decode_tps: r.get(3)?,
+                    avg_ttft_s: r.get(4)?,
+                })
+            })?
+            .collect()
+        })
+        .map_err(err)?;
+    let recent = conn
+        .prepare(
+            "SELECT ended_ts, model, prompt_tokens, decoded, ttft_s, duration_s, avg_decode_tps \
+             FROM requests ORDER BY ended_ts DESC LIMIT 100",
+        )
+        .and_then(|mut q| {
+            q.query_map([], |r| {
+                Ok(LoggedRequest {
+                    ended_ts: r.get(0)?,
+                    model: r.get(1)?,
+                    prompt_tokens: r.get(2)?,
+                    decoded: r.get(3)?,
+                    ttft_s: r.get(4)?,
+                    duration_s: r.get(5)?,
+                    avg_decode_tps: r.get(6)?,
+                })
+            })?
+            .collect()
+        })
+        .map_err(err)?;
+    Ok(LogSummary {
+        path: path.to_path_buf(),
+        bytes,
+        counts,
+        span: first.zip(last),
+        models,
+        recent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,7 +405,65 @@ mod tests {
             .query_row("SELECT decoded FROM requests", [], |r| r.get(0))
             .unwrap();
         assert_eq!(decoded, 10);
+
+        let sum = summarize(&path).unwrap();
+        assert_eq!(
+            sum.counts,
+            vec![("model_samples", 2), ("gpu_samples", 2), ("requests", 1)]
+        );
+        assert!(sum.span.is_some());
+        assert_eq!(sum.models.len(), 1);
+        assert_eq!((sum.models[0].requests, sum.models[0].decoded), (1, 10));
+        assert_eq!(sum.recent.len(), 1);
+        assert_eq!(sum.recent[0].model, model.name);
+        drop(log);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn context_speed_buckets_decode_samples_per_model() {
+        let path =
+            std::env::temp_dir().join(format!("llm-visuals-ctxspeed-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
+        let log = DbLog::open(&path, Duration::ZERO, 0).unwrap();
+        // (model, processing, decode, prefill, ctx)
+        let rows = [
+            ("a", 1, 60.0, 0.0, 1000),
+            ("a", 1, 40.0, 0.0, 1100),
+            ("a", 1, 30.0, 0.0, 9000),
+            ("a", 1, 99.0, 500.0, 1000), // still prefilling
+            ("a", 0, 99.0, 0.0, 1000),   // idle
+            ("b", 1, 20.0, 0.0, 500),
+        ];
+        for (m, p, d, pf, ctx) in rows {
+            log.conn
+                .execute(
+                    "INSERT INTO model_samples VALUES (0,1,?1,'x',?2,?3,?4,?5,8192,0,0)",
+                    params![m, p, d, pf, ctx],
+                )
+                .unwrap();
+        }
+        let got = context_speed(&path).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].model.as_str(), got[0].samples), ("a", 3));
+        // 1000..9000 in ≤ 13 rows of whole 256-token grains.
+        assert_eq!(got[0].step, 768);
+        assert_eq!(got[0].buckets, vec![(768, 50.0, 2), (8448, 30.0, 1)]);
+        assert_eq!(got[1].buckets, vec![(256, 20.0, 1)]);
+        drop(log);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn summarizing_a_missing_file_fails_without_creating_it() {
+        let path = std::env::temp_dir().join(format!("llm-visuals-nolog-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(summarize(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -9,12 +9,14 @@ mod gpu;
 mod host;
 mod llm;
 mod model_detect;
+pub mod nvml;
 mod observe;
 mod perf;
 mod pipeline;
 mod render;
 mod settings;
 mod sglang;
+mod vision;
 mod vllm;
 
 use config::{Args, ViewMode};
@@ -25,16 +27,17 @@ use crossterm::{
 };
 use fade::{FadeSample, FadeState};
 use gguf::layer_device;
-use gpu::{GpuMonitor, GpuSample, GpuStats};
+use gpu::{GpuBackend, GpuMonitor, GpuSample, GpuStats};
 use host::{HostMonitor, HostSample};
 use model_detect::DetectedModel;
-use observe::{ExpertStats, LiveStats, SpecMetrics};
+use observe::{ExpertStats, HttpAuth, LiveStats, SpecMetrics};
 use perf::PerfTracker;
 use pipeline::{ActivityAggregator, GeneratedText, TokenBuffer};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use render::{Dashboard, ModelView, Renderer};
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -94,37 +97,129 @@ impl ModelSlot {
     }
 }
 
+/// Cmdline `--api-key` / `--api-key-file` wins; otherwise the launch key file.
+fn auth_for(model: &DetectedModel, fallback: &HttpAuth) -> HttpAuth {
+    HttpAuth::from_token(model_detect::api_key_from(&model.cmdline)).or(fallback)
+}
+
 /// The servers to watch: everything detected, minus anything the `--pid`
-/// filter excludes, capped at `--max-models`.
-async fn discover(args: &Args) -> Vec<DetectedModel> {
+/// filter excludes, capped at `--max-models`. Returns detected models and an
+/// optional error note if an explicitly requested endpoint failed.
+async fn discover(args: &Args, auth: &HttpAuth) -> (Vec<DetectedModel>, Option<String>) {
     let filter = args.pid_filter();
-    let mut found = model_detect::detect_models();
+    let mut explicit_models = Vec::new();
+    let mut explicit_error = None;
+    let explicit_ep = args.endpoint_url();
+
+    // 1. Explicit endpoint URL (--endpoint, --model http://..., or LLM_ENDPOINT)
+    if let Some(ref ep) = explicit_ep {
+        match model_detect::parse_endpoint(ep) {
+            Ok((host, port, path)) => {
+                if let Some(m) = model_detect::probe_endpoint(&host, port, &path, auth).await {
+                    explicit_models.push(m);
+                } else {
+                    explicit_error = Some(format!(
+                        "failed to connect to inference server at {ep} (press r to retry)"
+                    ));
+                }
+            }
+            Err(e) => {
+                explicit_error = Some(format!("invalid endpoint '{ep}': {e}"));
+            }
+        }
+    }
+
+    // 2. Scan processes for running LLM servers
+    let mut proc_models = model_detect::detect_models();
+
+    // 3. If no models found by process scan and no explicit endpoint was configured,
+    // probe local candidate endpoints (vLLM, llama.cpp, etc.)
+    if proc_models.is_empty() && explicit_ep.is_none() {
+        proc_models = model_detect::probe_local_endpoints(auth).await;
+    }
+
+    // Filter process-detected models by PID if requested (exempt explicitly requested endpoints)
     if !filter.is_empty() {
-        found.retain(|m| filter.contains(&m.pid));
+        proc_models.retain(|m| filter.contains(&m.pid));
+    }
+
+    // Merge discovered models, avoiding duplicate ports or names
+    let mut found = explicit_models;
+    for m in proc_models {
+        let duplicate = found.iter_mut().find(|fm| {
+            (fm.port.is_some() && fm.port == m.port) || (!fm.name.is_empty() && fm.name == m.name)
+        });
+        if let Some(fm) = duplicate {
+            let is_loopback = matches!(
+                fm.host.as_str(),
+                "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "[::1]"
+            );
+            if is_loopback {
+                if fm.pid == 0 {
+                    fm.pid = m.pid;
+                }
+                if fm.gpu_indices.is_empty() {
+                    fm.gpu_indices = m.gpu_indices;
+                }
+                if fm.mem_used_mb == 0 {
+                    fm.mem_used_mb = m.mem_used_mb;
+                }
+                if fm.gguf.is_none() {
+                    fm.gguf = m.gguf;
+                    fm.tensors = m.tensors;
+                }
+                // The process scan can place the encoder; a port probe can't.
+                if m.vision.is_some()
+                    && fm
+                        .vision
+                        .as_ref()
+                        .map_or(true, |v| v.place == vision::Place::Unknown)
+                {
+                    fm.vision = m.vision;
+                }
+                if fm.path.is_none() || fm.path.as_ref().is_some_and(|p| !p.exists()) {
+                    if let Some(p) = m.path {
+                        fm.path = Some(p);
+                    }
+                }
+            }
+        } else {
+            found.push(m);
+        }
     }
     found.truncate(args.max_models.max(1));
     // `llama-server -hf owner/repo:quant` does not put a local GGUF path on
     // its command line. Current llama.cpp exposes the resolved path via
     // `/props`; use it so layer counts and tensor layout remain available.
+    // `/props` also says whether a vision projector actually loaded.
     let mut probes = tokio::task::JoinSet::new();
     for (index, model) in found.iter().enumerate() {
-        if model.engine == "llama.cpp" && model.gguf.is_none() {
+        if model.engine == "llama.cpp" {
             if let Some(port) = model.port {
-                probes.spawn(async move { (index, observe::poll_llama_props(port).await) });
+                let auth = auth_for(model, auth);
+                let host = model.host.clone();
+                probes.spawn(async move {
+                    (index, observe::poll_llama_props(&host, port, &auth).await)
+                });
             }
         }
     }
     while let Some(result) = probes.join_next().await {
         if let Ok((index, Some(props))) = result {
             if let Some(model) = found.get_mut(index) {
-                model_detect::load_gguf_metadata(model, props.model_path.into());
-                if let Some(alias) = props.model_alias {
-                    model.name = alias;
+                if let Some(loaded) = props.vision {
+                    model_detect::apply_props_vision(model, loaded);
+                }
+                if model.gguf.is_none() {
+                    model_detect::load_gguf_metadata(model, props.model_path.into());
+                    if let Some(alias) = props.model_alias {
+                        model.name = alias;
+                    }
                 }
             }
         }
     }
-    found
+    (found, explicit_error)
 }
 
 /// One poller per model, each talking to its own server's port. They are
@@ -136,6 +231,7 @@ fn spawn_pollers(
     spec_tx: &mpsc::Sender<(u32, SpecMetrics)>,
     experts_tx: &mpsc::Sender<(u32, ExpertStats)>,
     poll: Duration,
+    auth: &HttpAuth,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     // Cross-wiring guard input: every other detected model's (name, port)
     // pair, so a vLLM slot can reject samples whose model_name label
@@ -151,12 +247,21 @@ fn spawn_pollers(
             let live_tx = live_tx.clone();
             let spec_tx = spec_tx.clone();
             let experts_tx = experts_tx.clone();
-            let others = others.clone();
+            let context = PollContext {
+                others: others.clone(),
+                auth: auth_for(&m, auth),
+            };
             tokio::spawn(async move {
-                poll_server(m, port, live_tx, spec_tx, experts_tx, others, poll).await
+                poll_server(m, port, live_tx, spec_tx, experts_tx, context, poll).await
             })
         })
         .collect()
+}
+
+#[derive(Clone)]
+struct PollContext {
+    others: Vec<(String, u16)>,
+    auth: HttpAuth,
 }
 
 async fn poll_server(
@@ -165,16 +270,17 @@ async fn poll_server(
     live_tx: mpsc::Sender<(u32, LiveStats)>,
     spec_tx: mpsc::Sender<(u32, SpecMetrics)>,
     experts_tx: mpsc::Sender<(u32, ExpertStats)>,
-    others: Vec<(String, u16)>,
+    context: PollContext,
     poll: Duration,
 ) {
+    let PollContext { others, auth } = context;
     let pid = model.key();
     if model.engine == "sglang" {
         // SGLang has no /slots. /v1/loads is always on; /server_info is
         // fetched once at attach. Each poll is a line in SGLang's access
         // log, so we never go faster than 400 ms.
         let mut adapter = sglang::SglangAdapter::new();
-        let mut info = sglang::poll_server_info(port).await;
+        let mut info = sglang::poll_server_info(&model.host, port, &auth).await;
         let mut metrics_ok = true;
         let mut metrics_misses = 0u32;
         let mut misses = 0u32;
@@ -193,10 +299,10 @@ async fn poll_server(
             .unwrap_or(0);
         loop {
             if info.is_none() {
-                info = sglang::poll_server_info(port).await;
+                info = sglang::poll_server_info(&model.host, port, &auth).await;
             }
             let metrics = if metrics_ok {
-                match sglang::poll_sglang_metrics(port).await {
+                match sglang::poll_sglang_metrics(&model.host, port, &auth).await {
                     Some(m) => Some(m),
                     None => {
                         metrics_misses += 1;
@@ -209,7 +315,7 @@ async fn poll_server(
             } else {
                 None
             };
-            if let Some(c) = sglang::poll_loads(port).await {
+            if let Some(c) = sglang::poll_loads(&model.host, port, &auth).await {
                 misses = 0;
                 let (mut stats, spec_pair) = adapter.observe(&c, metrics.as_ref());
                 stats.ctx_max = info
@@ -265,7 +371,7 @@ async fn poll_server(
         let mut adapter = vllm::VllmAdapter::new();
         let mut misses = 0u32;
         loop {
-            if let Some(c) = vllm::poll_vllm(port, &model.name, &others).await {
+            if let Some(c) = vllm::poll_vllm(&model.host, port, &model.name, &others, &auth).await {
                 misses = 0;
                 let (mut stats, spec) = adapter.observe(&c);
                 stats.ctx_max = model.ctx_max.unwrap_or(0);
@@ -291,19 +397,35 @@ async fn poll_server(
             tokio::time::sleep(delay).await;
         }
     }
+    if model.engine == "ollama" {
+        // Ollama exposes /v1/models and /api/tags, but no /slots or Prometheus /metrics.
+        // Populate initial slot metadata and keep alive without spamming 404s.
+        let stats = LiveStats {
+            ctx_max: model.ctx_max.unwrap_or(0),
+            ..Default::default()
+        };
+        let _ = live_tx.try_send((pid, stats));
+        loop {
+            tokio::time::sleep(poll.max(Duration::from_secs(2))).await;
+        }
+    }
     let mut metrics_ok = true;
     let mut metrics_misses = 0u32;
     let mut experts_ok = true;
     let mut experts_misses = 0u32;
+    let mut decode_fallback = observe::DecodeFallback::default();
+    let host = model.host.clone();
     loop {
-        if let Some(stats) = observe::poll_llama(port).await {
-            let _ = live_tx.try_send((pid, stats));
-        }
+        let mut stats_opt = observe::poll_llama(&host, port, &auth).await;
         // Draft/MTP counters live on /metrics; skip once we know this server
-        // was started without --metrics.
+        // was started without --metrics. The same scrape fills decode when
+        // /slots left `n_decoded` out.
         if metrics_ok {
-            match observe::poll_metrics(port).await {
+            match observe::poll_metrics(&host, port, &auth).await {
                 Some(m) => {
+                    if let Some(stats) = stats_opt.as_mut() {
+                        decode_fallback.apply(stats, m.tokens_predicted);
+                    }
                     let _ = spec_tx.try_send((pid, m));
                 }
                 None => metrics_misses += 1,
@@ -312,9 +434,12 @@ async fn poll_server(
                 metrics_ok = false;
             }
         }
+        if let Some(stats) = stats_opt {
+            let _ = live_tx.try_send((pid, stats));
+        }
         // Real MoE routing needs the patched server (--expert-stats).
         if experts_ok {
-            match observe::poll_experts(port).await {
+            match observe::poll_experts(&host, port, &auth).await {
                 Some(e) => {
                     let _ = experts_tx.try_send((pid, e));
                 }
@@ -350,7 +475,7 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
     match slots.len() {
         0 => format!(
-            "{prefix}no running LLM found (nvidia-smi / llama-server / ollama) — press r to rescan"
+            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang) — press r to rescan"
         ),
         1 => format!("{prefix}attached to {}", slots[0].model),
         n => format!(
@@ -366,24 +491,23 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Child of vision::cuda_bus_ids, run under a server's CUDA environment.
+    if std::env::args().nth(1).as_deref() == Some(vision::CUDA_PROBE_ARG) {
+        std::process::exit(if vision::print_cuda_bus_ids() { 0 } else { 1 });
+    }
     let launch = settings::launch();
     let mut args = launch.args.clone();
+    let auth = HttpAuth::from_key_file(args.api_key_file.as_deref())?;
     colors::init_color_mode(&args.color);
     let mut theme_name = args.theme.clone();
     let theme = colors::get_theme(&theme_name);
 
-    let mut slots: Vec<ModelSlot> = if args.demo {
-        demo::demo_models(DEMO_CTX, args.demo_models)
-            .into_iter()
-            .map(ModelSlot::new)
-            .collect()
+    let (discovered, endpoint_err) = if args.demo {
+        (demo::demo_models(DEMO_CTX, args.demo_models), None)
     } else {
-        discover(&args)
-            .await
-            .into_iter()
-            .map(ModelSlot::new)
-            .collect()
+        discover(&args, &auth).await
     };
+    let mut slots: Vec<ModelSlot> = discovered.into_iter().map(ModelSlot::new).collect();
     let mut focus: usize = 0;
 
     let moe_experts = slots
@@ -395,7 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Opened before raw mode so a bad explicit path fails with a readable
     // error. The default location only turns logging off: it was not asked for.
-    let mut startup_note = launch.warning.clone();
+    let mut startup_note = endpoint_err.or_else(|| launch.warning.clone());
     let mut db = match open_db(&args) {
         Ok(db) => db,
         Err(e) if args.log_db == "auto" => {
@@ -454,11 +578,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (spec_tx, mut spec_rx) = mpsc::channel::<(u32, SpecMetrics)>(256);
     let (experts_tx, mut experts_rx) = mpsc::channel::<(u32, ExpertStats)>(64);
     let (host_tx, mut host_rx) = mpsc::channel::<Vec<(u32, HostSample)>>(64);
-    let (pids_tx, pids_rx) =
-        tokio::sync::watch::channel(slots.iter().map(|s| s.model.key()).collect::<Vec<u32>>());
+    let (pids_tx, pids_rx) = tokio::sync::watch::channel(
+        slots
+            .iter()
+            .filter_map(|s| {
+                if s.model.pid != 0 {
+                    Some(s.model.pid)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<u32>>(),
+    );
     let gpu_filter = args.gpu_indices();
     let mut poll = Duration::from_millis(args.poll_ms.max(50));
     let mut pollers: Vec<JoinHandle<()>> = Vec::new();
+
+    let (gpu_backend, nvml_host, backend_name) = if args.demo {
+        (None, None, "demo")
+    } else {
+        let nvml = if args.no_nvml {
+            None
+        } else {
+            nvml::NvmlSession::new()
+        };
+        let backend = Arc::new(GpuBackend::detect(nvml));
+        let nvml_host = match backend.as_ref() {
+            GpuBackend::Nvml(session) => Some(session.clone()),
+            _ => None,
+        };
+        let name = backend.name();
+        (Some(backend), nvml_host, name)
+    };
 
     if args.demo {
         let n = if gpu_filter.is_empty() {
@@ -483,15 +634,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &spec_tx,
             &experts_tx,
             poll,
+            &auth,
         );
+        let host_gpu_filter = gpu_filter.clone();
+        let gpu_backend_poll = Arc::clone(gpu_backend.as_ref().unwrap());
         tokio::spawn(async move {
-            GpuMonitor::new().run(gpu_tx, gpu_filter).await;
+            GpuMonitor::new(gpu_backend_poll)
+                .run(gpu_tx, gpu_filter)
+                .await;
         });
         tokio::spawn(async move {
-            // Two nvidia-smi calls per poll would be heavy; host counters at half rate is plenty.
-            HostMonitor::new(poll.max(Duration::from_millis(400)))
-                .run(host_tx, pids_rx)
-                .await;
+            // Host counters at half the GPU polling rate are plenty.
+            HostMonitor::new(
+                poll.max(Duration::from_millis(400)),
+                nvml_host,
+                host_gpu_filter,
+            )
+            .run(host_tx, pids_rx)
+            .await;
         });
     }
 
@@ -504,8 +664,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut latest_gpu: Vec<GpuStats> = Vec::new();
     let mut gpu_error: Option<String> = None;
-    if !args.demo {
-        match GpuMonitor::collect_once() {
+    if let Some(backend) = &gpu_backend {
+        match GpuMonitor::collect_once(backend) {
             Ok(stats) => latest_gpu = gpu::filter_gpus(stats, &args.gpu_indices()),
             Err(e) => gpu_error = Some(e),
         }
@@ -532,11 +692,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         status = note;
     }
     let mut settings_form: Option<settings::SettingsForm> = None;
+    let mut log_view: Option<Result<dblog::LogSummary, String>> = None;
+    // The context-speed screen (`c`) and the model it shows.
+    let mut ctx_view: Option<(Result<Vec<dblog::ContextSpeed>, String>, usize)> = None;
+    // The file being logged to, else the default one from earlier sessions.
+    let log_path = |args: &Args| {
+        args.log_db_path()
+            .or_else(settings::default_db_path)
+            .ok_or_else(|| "no home directory for the log database".to_string())
+    };
+    let read_log = |args: &Args| log_path(args).and_then(|p| dblog::summarize(&p));
+    let read_ctx = |args: &Args| log_path(args).and_then(|p| dblog::context_speed(&p));
+    let mut last_visual_activity = Instant::now();
 
     loop {
         tokio::task::yield_now().await;
         let mut rescan = false;
+        let mut ui_changed = false;
         if event::poll(Duration::from_millis(0))? {
+            ui_changed = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press && settings_form.is_some() {
                     let form = settings_form.as_mut().unwrap();
@@ -597,6 +771,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if close {
                         settings_form = None;
                     }
+                } else if key.kind == KeyEventKind::Press && log_view.is_some() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => log_view = None,
+                        KeyCode::Char('r') => log_view = Some(read_log(&args)),
+                        _ => {}
+                    }
+                } else if key.kind == KeyEventKind::Press && ctx_view.is_some() {
+                    let (speeds, sel) = ctx_view.as_mut().unwrap();
+                    let n = speeds.as_ref().map_or(0, |v| v.len()).max(1);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => ctx_view = None,
+                        KeyCode::Char('r') => *speeds = read_ctx(&args),
+                        KeyCode::Right | KeyCode::Tab => *sel = (*sel + 1) % n,
+                        KeyCode::Left | KeyCode::BackTab => *sel = (*sel + n - 1) % n,
+                        _ => {}
+                    }
                 } else if key.kind == KeyEventKind::Press {
                     let n = slots.len().max(1);
                     match key.code {
@@ -620,6 +810,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('s') => {
                             settings_form = Some(settings::SettingsForm::new(&args))
                         }
+                        KeyCode::Char('l') => log_view = Some(read_log(&args)),
+                        KeyCode::Char('c') => {
+                            let speeds = read_ctx(&args);
+                            // Open on the focused model when it has samples.
+                            let name = slots.get(focus).map(|s| s.model.name.as_str());
+                            let sel = speeds
+                                .as_ref()
+                                .ok()
+                                .and_then(|v| v.iter().position(|m| Some(m.model.as_str()) == name))
+                                .unwrap_or(0);
+                            ctx_view = Some((speeds, sel));
+                        }
                         KeyCode::Char('t') => {
                             theme_name = colors::next_theme_name(&theme_name).to_string();
                             renderer.theme = colors::get_theme(&theme_name);
@@ -631,11 +833,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if rescan {
+            ui_changed = true;
             for h in pollers.drain(..) {
                 h.abort();
             }
             // Keep the counters of models that are still up.
-            let found = discover(&args).await;
+            let (found, rescan_err) = discover(&args, &auth).await;
             let mut kept: Vec<ModelSlot> = Vec::with_capacity(found.len());
             for m in found {
                 match slots.iter().position(|s| s.model.key() == m.key()) {
@@ -659,20 +862,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .enumerate()
                 .map(|(i, s)| (s.model.key(), i))
                 .collect();
-            let _ = pids_tx.send(slots.iter().map(|s| s.model.key()).collect());
+            let _ = pids_tx.send(
+                slots
+                    .iter()
+                    .filter_map(|s| {
+                        if s.model.pid != 0 {
+                            Some(s.model.pid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            );
             pollers = spawn_pollers(
                 &slots.iter().map(|s| s.model.clone()).collect::<Vec<_>>(),
                 &live_tx,
                 &spec_tx,
                 &experts_tx,
                 poll,
+                &auth,
             );
-            status = status_for(&slots, true);
+            if let Some(err) = rescan_err {
+                status = err;
+            } else {
+                status = status_for(&slots, true);
+            }
         }
 
         let now = Instant::now();
         let mut gpu_updated = false;
         while let Ok(sample) = gpu_rx.try_recv() {
+            ui_changed = true;
             match sample {
                 Ok(stats) => {
                     latest_gpu = stats;
@@ -692,6 +912,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slot.routing = None;
         }
         while let Ok((pid, e)) = experts_rx.try_recv() {
+            ui_changed = true;
             let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) else {
                 continue;
             };
@@ -709,18 +930,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slot.experts = Some(e);
         }
         while let Ok((pid, m)) = spec_rx.try_recv() {
+            ui_changed = true;
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 slot.perf.observe_spec(&m, now);
             }
         }
         while let Ok(batch) = host_rx.try_recv() {
+            ui_changed = true;
             for (pid, h) in batch {
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                     slot.perf.observe_host(&h, now);
+                } else if pid == 0 {
+                    for slot in &mut slots {
+                        slot.perf.observe_host(&h, now);
+                    }
                 }
             }
         }
         while let Ok((pid, s)) = live_rx.try_recv() {
+            ui_changed = true;
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 if s.ctx_max > 0 {
                     slot.ctx_max = s.ctx_max;
@@ -731,6 +959,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         while let Ok(event) = events_rx.try_recv() {
+            ui_changed = true;
             match event {
                 llm::LlmEvent::ModelInfo {
                     num_layers: nl,
@@ -773,6 +1002,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Preserve the 30 FPS animation cadence while a request is active and
+        // while its heat/fade effects settle. Once fully idle, fresh telemetry
+        // or input drives rendering at the 200 ms sample cadence. The loop
+        // still wakes at 30 Hz, so interaction and new requests stay prompt.
+        if slots.iter().any(|slot| slot.live.processing) {
+            last_visual_activity = now;
+        }
+        let animate = now.duration_since(last_visual_activity) < Duration::from_secs(3);
+        if !animate && !ui_changed {
+            if !running && !done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(33)).await;
+            continue;
+        }
+
         let frame_dt = (now - last_frame).as_secs_f32().clamp(0.0, 1.0);
         last_frame = now;
         for slot in &mut slots {
@@ -810,6 +1055,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             detected: cur.map(|v| v.detected),
             gpus: &latest_gpu,
             gpu_error: gpu_error.as_deref(),
+            gpu_backend: Some(backend_name),
             fade: cur.map(|v| v.fade).unwrap_or(&empty_fade),
             perf: cur.map(|v| v.perf).unwrap_or(&empty_perf),
             live: cur.map(|v| v.live).unwrap_or(&empty_live),
@@ -823,6 +1069,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             demo: args.demo,
             experts: cur.and_then(|v| v.experts),
             settings: settings_form.as_ref(),
+            log: log_view.as_ref(),
+            ctx_speed: ctx_view.as_ref().map(|(s, i)| (s, *i)),
         };
         renderer.render_frame(&mut terminal, &dash);
 
@@ -836,6 +1084,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(io::stdout(), LeaveAlternateScreen)?;
     _guard.restored = true;
     Ok(())
+}
+
+/// Total bytes of the model weight files inside a served directory
+/// (`*.safetensors`, `*.gguf`, `pytorch_model*.bin`). Symlinks count at
+/// their target's size, since an HF cache snapshot is all symlinks into
+/// `blobs/`; unreadable entries are skipped.
+fn dir_model_bytes(dir: &std::path::Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_model = name.ends_with(".safetensors")
+            || name.ends_with(".gguf")
+            || (name.ends_with(".bin") && name.starts_with("pytorch_model"));
+        if !is_model {
+            continue;
+        }
+        // DirEntry::metadata does not follow symlinks on Unix.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
+            if meta.is_file() {
+                total += meta.len();
+                any = true;
+            }
+        }
+    }
+    any.then_some(total)
 }
 
 fn fade_sample_from_live(
@@ -863,8 +1137,9 @@ fn fade_sample_from_live(
         }
     }
     let n_layers = n_layers.max(1);
+    let model_gpus: Vec<u32> = detected.map(|d| d.gpu_indices.clone()).unwrap_or_default();
     let layer_gpu: Vec<usize> = (0..n_layers)
-        .map(|l| layer_device(l, n_layers, &split))
+        .map(|l| layer_device(l, n_layers, &split, &model_gpus))
         .collect();
     let processing = live.processing;
     let layer_target: Vec<f32> = (0..n_layers)
@@ -887,26 +1162,49 @@ fn fade_sample_from_live(
         .weight_gb
         .map(|g| (g * 1024.0) as u64)
         .or_else(|| {
-            detected
-                .and_then(|d| d.path.as_ref())
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() / (1024 * 1024))
+            detected.and_then(|d| d.path.as_ref()).and_then(|p| {
+                // A GGUF checkpoint is a single file; a served HF model is a
+                // directory of shards. stat() on a directory returns the size
+                // of the directory entry (4096), which would zero the weights
+                // segment and blame everything on KV — sum the shards instead.
+                if p.is_dir() {
+                    dir_model_bytes(p).map(|b| b / (1024 * 1024))
+                } else {
+                    std::fs::metadata(p).ok().map(|m| m.len() / (1024 * 1024))
+                }
+            })
         })
         .or_else(|| detected.map(|d| d.mem_used_mb))
         .unwrap_or(0);
     let split_sum: f32 = split.iter().copied().sum::<f32>().max(1.0);
     let mut weight_frac = vec![0.0f32; n_gpus];
     let mut kv_alloc_frac = vec![0.0f32; n_gpus];
+    // Placement, not the weight estimate: a model whose size is unknown
+    // still owns the cards it runs on.
+    let mut model_owned = vec![false; n_gpus];
     for g in gpu {
         let i = g.index as usize;
         if i >= n_gpus {
             continue;
         }
-        let share = if split.is_empty() {
-            1.0 / gpu.len().max(1) as f32
-        } else {
+        let share = if !split.is_empty() {
             split.get(i).copied().unwrap_or(0.0) / split_sum
+        } else if let Some(idxs) =
+            detected.and_then(|d| (!d.gpu_indices.is_empty()).then_some(d.gpu_indices.as_slice()))
+        {
+            // Engine told us which GPUs it actually uses (e.g. one-GPU
+            // vLLM serve): spread evenly over those, zero elsewhere.
+            let own = idxs.iter().filter(|&&g| g as usize == i).count();
+            if own > 0 {
+                1.0 / idxs.len().max(1) as f32
+            } else {
+                0.0
+            }
+        } else {
+            // Unknown layout: assume it spans every visible GPU.
+            1.0 / gpu.len().max(1) as f32
         };
+        model_owned[i] = share > 0.0;
         let used_f = if g.mem_total_mb == 0 {
             0.0
         } else {
@@ -942,10 +1240,214 @@ fn fade_sample_from_live(
         gpu_vram: vram.into_iter().take(n_gpus.max(1)).collect(),
         weight_frac,
         kv_alloc_frac,
+        model_owned,
         ctx_used: used,
         ctx_max,
         n_experts: n_exp_total,
         n_experts_used: n_exp_used,
         n_heads: detected.map(|d| d.n_heads()).unwrap_or(1).max(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn dir_model_bytes_sums_weight_shards_only() {
+        let root =
+            std::env::temp_dir().join(format!("llm-visuals-test-dirmodel-{}", std::process::id()));
+        let dir = root.join("model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 3000],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model-00002-of-00002.safetensors"),
+            vec![0u8; 2000],
+        )
+        .unwrap();
+        // Non-weight files must not count.
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("SHA256SUMS.local"), b"xx").unwrap();
+        // A pytorch_model .bin counts; a random .bin does not.
+        std::fs::write(dir.join("pytorch_model.bin"), vec![0u8; 500]).unwrap();
+        std::fs::write(dir.join("notes.bin"), b"x").unwrap();
+        assert_eq!(dir_model_bytes(&dir), Some(5500));
+
+        // HF cache layout: snapshot entries are symlinks into blobs/.
+        #[cfg(unix)]
+        {
+            let blobs = root.join("blobs");
+            let snap = root.join("snapshot");
+            std::fs::create_dir_all(&blobs).unwrap();
+            std::fs::create_dir_all(&snap).unwrap();
+            std::fs::write(blobs.join("abc123"), vec![0u8; 4096]).unwrap();
+            std::os::unix::fs::symlink(blobs.join("abc123"), snap.join("model.safetensors"))
+                .unwrap();
+            assert_eq!(dir_model_bytes(&snap), Some(4096));
+        }
+
+        // Empty dir (no weight files) → None so the mem_used fallback fires.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("config.json"), "{}").unwrap();
+        assert_eq!(dir_model_bytes(&empty), None);
+
+        // Missing dir → None.
+        assert_eq!(
+            dir_model_bytes(&PathBuf::from("/nonexistent-llm-visuals")),
+            None
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    const CANNED_VLLM_MODELS: &str = r#"{"object":"list","data":[{"id":"test-model","object":"model","created":1789774371,"owned_by":"vllm","max_model_len":4096}]}"#;
+    const CANNED_OLLAMA_MODELS: &str = r#"{"object":"list","data":[{"id":"llama3:latest","object":"model","created":1789774371,"owned_by":"library"}]}"#;
+    const CANNED_VLLM_METRICS: &str = "# HELP vllm:num_requests_running Number of requests currently running\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{model_name=\"test-model\"} 1\n";
+
+    async fn spawn_mock_server(
+        models_json: &'static str,
+        metrics_body: &'static str,
+    ) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    res = listener.accept() => {
+                        let (mut stream, _) = match res {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        };
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            if let Ok(n) = stream.read(&mut buf).await {
+                                let req = String::from_utf8_lossy(&buf[..n]);
+                                let (body, ct) = if req.contains("/v1/models") || req.contains("/models") {
+                                    (models_json, "application/json")
+                                } else if req.contains("/metrics") {
+                                    (metrics_body, "text/plain")
+                                } else {
+                                    ("", "text/plain")
+                                };
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        (port, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn discover_with_explicit_endpoint() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", &ep]).unwrap();
+        assert!(args.is_endpoint());
+        assert_eq!(args.endpoint_url().as_deref(), Some(ep.as_str()));
+
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none(), "Unexpected error: {err:?}");
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("explicit endpoint model");
+        assert_eq!(m.engine, "vllm");
+        assert_eq!(m.name, "test-model");
+        assert_eq!(m.ctx_max, Some(4096));
+        assert_eq!(m.pid, 0);
+        assert!(m.gpu_indices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_with_model_url() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--model", &ep]).unwrap();
+        assert!(args.is_endpoint());
+        assert_eq!(args.endpoint_url().as_deref(), Some(ep.as_str()));
+
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("model URL endpoint");
+        assert_eq!(m.engine, "vllm");
+        assert_eq!(m.name, "test-model");
+        assert_eq!(m.pid, 0);
+        assert!(m.gpu_indices.is_empty());
+    }
+
+    #[tokio::test]
+
+    async fn discover_exempts_explicit_endpoint_from_pid_filter() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_VLLM_MODELS, CANNED_VLLM_METRICS).await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args =
+            Args::try_parse_from(["llm-visuals", "--endpoint", &ep, "--pid", "999999"]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        assert_eq!(
+            models.len(),
+            1,
+            "Explicit endpoint should not be dropped by pid filter"
+        );
+        assert_eq!(models[0].pid, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_detects_ollama_server() {
+        let (port, _shutdown) = spawn_mock_server(CANNED_OLLAMA_MODELS, "").await;
+        let ep = format!("http://127.0.0.1:{port}/v1");
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", &ep]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_none());
+        let m = models
+            .iter()
+            .find(|m| m.port == Some(port))
+            .expect("ollama endpoint");
+        assert_eq!(m.engine, "ollama");
+        assert_eq!(m.name, "llama3:latest");
+        assert_eq!(m.pid, 0);
+    }
+
+    #[tokio::test]
+    async fn discover_reports_unreachable_explicit_endpoint() {
+        let args =
+            Args::try_parse_from(["llm-visuals", "--endpoint", "http://127.0.0.1:1/v1"]).unwrap();
+        let (models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_some());
+        assert!(err
+            .unwrap()
+            .contains("failed to connect to inference server"));
+        assert!(
+            models.iter().all(|m| m.port != Some(1)),
+            "unreachable explicit port must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_reports_unsupported_https_endpoint() {
+        let args = Args::try_parse_from(["llm-visuals", "--endpoint", "https://localhost:7000/v1"])
+            .unwrap();
+        let (_models, err) = discover(&args, &HttpAuth::default()).await;
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("HTTPS is not supported"));
     }
 }

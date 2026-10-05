@@ -1,13 +1,15 @@
 //! Host-side counters behind the memory pipeline: disk reads (system-wide
 //! and by the inference process), page faults, resident weights in RAM, and
-//! PCIe traffic per GPU from `nvidia-smi dmon`. Everything is a cumulative
+//! PCIe traffic per NVIDIA GPU from `nvidia-smi dmon`. Everything is a cumulative
 //! counter or an instantaneous reading; `perf::BandwidthStats` turns them
 //! into rates.
 // The /proc parsers are Linux-only at runtime but stay tested everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::nvml::NvmlSession;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone, Default)]
@@ -31,18 +33,25 @@ pub struct HostSample {
 
 pub struct HostMonitor {
     interval: Duration,
+    nvml: Option<Arc<NvmlSession>>,
+    /// GPU indices the panel shows; empty means all. Only the NVML PCIe path uses it.
+    gpu_filter: Vec<usize>,
 }
 
 impl HostMonitor {
-    pub fn new(interval: Duration) -> Self {
-        Self { interval }
+    pub fn new(interval: Duration, nvml: Option<Arc<NvmlSession>>, gpu_filter: Vec<usize>) -> Self {
+        Self {
+            interval,
+            nvml,
+            gpu_filter,
+        }
     }
 
     /// Poll until the receiver goes away. `pids_rx` follows the detected
     /// servers so a rescan retargets the per-process counters. One sample is
     /// produced per PID: the system-wide fields (disk, memory, PCIe) are read
-    /// once and shared, so watching six models costs no more `nvidia-smi`
-    /// calls than watching one.
+    /// once and shared, so watching six models costs no more collector calls
+    /// than watching one.
     pub async fn run(
         self,
         tx: mpsc::Sender<Vec<(u32, HostSample)>>,
@@ -50,10 +59,50 @@ impl HostMonitor {
     ) {
         let mut pcie_ok = true;
         let mut pcie_misses = 0u32;
+        let nvml = self.nvml;
+        let gpu_filter = self.gpu_filter;
+        #[cfg(not(target_os = "linux"))]
+        let mut sys = sysinfo::System::new();
+
         loop {
             let pids = pids_rx.borrow_and_update().clone();
             let want_pcie = pcie_ok;
-            let sample = tokio::task::spawn_blocking(move || collect(&pids, want_pcie)).await;
+            let nvml_ref = nvml.clone();
+            let filter_ref = gpu_filter.clone();
+
+            #[cfg(target_os = "linux")]
+            let sample = tokio::task::spawn_blocking(move || {
+                collect(&pids, want_pcie, nvml_ref.as_deref(), &filter_ref)
+            })
+            .await;
+
+            #[cfg(not(target_os = "linux"))]
+            let (sample, returned_sys) = {
+                let mut current_sys = sys;
+                let res = tokio::task::spawn_blocking(move || {
+                    let s = collect(
+                        &pids,
+                        want_pcie,
+                        nvml_ref.as_deref(),
+                        &filter_ref,
+                        &mut current_sys,
+                    );
+                    (s, current_sys)
+                })
+                .await;
+                match res {
+                    Ok((s, sys_back)) => (Ok::<_, String>(s), sys_back),
+                    Err(e) => (
+                        Err(format!("host monitor task failed: {e}")),
+                        sysinfo::System::new(),
+                    ),
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            {
+                sys = returned_sys;
+            }
+
             if let Ok(mut batch) = sample {
                 let got_pcie = batch.first().map(|(_, s)| s.pcie_ok).unwrap_or(false);
                 if want_pcie {
@@ -85,11 +134,20 @@ impl HostMonitor {
     }
 }
 
-fn collect(pids: &[u32], want_pcie: bool) -> Vec<(u32, HostSample)> {
+#[cfg(target_os = "linux")]
+fn collect(
+    pids: &[u32],
+    want_pcie: bool,
+    nvml: Option<&NvmlSession>,
+    gpu_filter: &[usize],
+) -> Vec<(u32, HostSample)> {
     let mut base = HostSample::default();
     read_system(&mut base);
     if want_pcie {
-        if let Some(p) = pcie_throughput() {
+        if let Some(p) = nvml
+            .and_then(|n| n.collect_pcie_throughput(gpu_filter))
+            .or_else(pcie_throughput)
+        {
             base.pcie_mb_s = p;
             base.pcie_ok = true;
         }
@@ -101,6 +159,37 @@ fn collect(pids: &[u32], want_pcie: bool) -> Vec<(u32, HostSample)> {
         .map(|&pid| {
             let mut s = base.clone();
             read_proc(pid, &mut s);
+            (pid, s)
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect(
+    pids: &[u32],
+    want_pcie: bool,
+    nvml: Option<&NvmlSession>,
+    gpu_filter: &[usize],
+    sys: &mut sysinfo::System,
+) -> Vec<(u32, HostSample)> {
+    let mut base = HostSample::default();
+    read_system(&mut base, sys);
+    if want_pcie {
+        if let Some(p) = nvml
+            .and_then(|n| n.collect_pcie_throughput(gpu_filter))
+            .or_else(pcie_throughput)
+        {
+            base.pcie_mb_s = p;
+            base.pcie_ok = true;
+        }
+    }
+    if pids.is_empty() {
+        return vec![(0, base)];
+    }
+    pids.iter()
+        .map(|&pid| {
+            let mut s = base.clone();
+            read_proc(pid, &mut s, sys);
             (pid, s)
         })
         .collect()
@@ -138,18 +227,16 @@ fn read_proc(pid: u32, s: &mut HostSample) {
 /// No /proc: memory from the OS. System-wide disk reads, page cache, page
 /// faults and file-backed RSS have no portable source and stay unknown.
 #[cfg(not(target_os = "linux"))]
-fn read_system(base: &mut HostSample) {
-    let mut sys = sysinfo::System::new();
+fn read_system(base: &mut HostSample, sys: &mut sysinfo::System) {
     sys.refresh_memory();
     base.mem_total_bytes = Some(sys.total_memory());
     base.mem_available_bytes = Some(sys.available_memory());
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_proc(pid: u32, s: &mut HostSample) {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+fn read_proc(pid: u32, s: &mut HostSample, sys: &mut sysinfo::System) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
     let pid = Pid::from_u32(pid);
-    let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,

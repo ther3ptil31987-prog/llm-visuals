@@ -3,9 +3,9 @@
 **A live terminal dashboard for the LLM running on your machine.**
 
 It finds the inference servers you already have up (llama.cpp `llama-server`,
-ollama, vLLM, SGLang, …), reads their counters and `nvidia-smi`, and turns them into a
-truecolor picture of what the model is doing right now: tokens per second, time
-to first token, GPU load and memory, context fill, speculative-decoding
+ollama, vLLM, SGLang, …), reads their counters and NVIDIA, AMD or Intel
+GPU telemetry, and turns them into a truecolor picture of what the model is doing
+right now: tokens per second, time to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
 exactly which experts a mixture-of-experts model routed the last token through.
 
@@ -40,9 +40,10 @@ a Tesla P100 under llama.cpp, mid-request.</sub>
 
 ## Quick start
 
-Requirements: a Rust toolchain (1.75+), `nvidia-smi` on the path for GPU
-panels, and a locally listening `llama-server` for throughput panels. Nothing
-at all is needed for demo mode.
+Requirements: a Rust toolchain (1.75+), `nvidia-smi` for NVIDIA GPU panels,
+`xpu-smi` for Intel GPU panels or the Linux amdgpu driver for AMD GPU panels,
+and a locally listening
+`llama-server` for throughput panels. Nothing at all is needed for demo mode.
 
 On Windows 11, see [Windows](#windows) for setup; on a Mac, see
 [macOS](#macos). Prebuilt binaries for all three, on x86-64 and ARM64, are
@@ -125,9 +126,13 @@ console, pass `--color truecolor` if colours look flat.
   rate counts every read the process makes (files, pipes, sockets), so it runs
   higher than on Linux. PCIe traffic needs `nvidia-smi dmon`, which Windows
   drivers may not support; the meter switches itself off after three failures.
-- **Servers in WSL2 or Docker** are not visible to a native Windows build. To
-  watch those, build and run llm-visuals inside WSL2 too; it then behaves
-  exactly as on Linux.
+- **Servers in WSL2 or Docker** are reachable via their published localhost
+  ports. Auto-detection probes local inference ports (e.g. 7000, 8000, 8080,
+  11434, 30000), or you can point directly at the server with
+  `--endpoint http://localhost:7000/v1` (or set `LLM_ENDPOINT`). Note that endpoints
+  use plain HTTP over TCP (HTTPS / TLS is not supported). Specifying an explicit
+  `--endpoint` (or `--model http://...`) attaches to that server directly and is
+  exempt from `--pid` filtering.
 
 ### What to test
 
@@ -267,6 +272,25 @@ gauge, temperature coloured by heat, SM clock, fan, PCIe link, a VRAM bar split
 into weights / KV in use / KV reserved / free, and utilisation and power
 history sparklines.
 
+Below the cards, a system RAM section shows memory in use / page cache / free
+against the machine's total, the focused model's resident size, and a history
+of RAM in use. It is on both the dashboard and the perf view, and is the first
+thing the panel drops on a short terminal.
+
+### Vision encoder
+
+When the model has a vision encoder loaded, the header says where it runs:
+`vision CPU`, or the card in the GPU panel's numbering followed by the
+engine's own name for it, e.g. `vision G1 RTX 3070 (CUDA0)`. llama.cpp puts
+the projector (`--mmproj`) on a device of its own, independent of
+`--device` and `--tensor-split`: the first CUDA device unless
+`--no-mmproj-offload` or `--mmproj-device` (`MTMD_BACKEND_DEVICE`) says
+otherwise. CUDA numbers cards fastest-first by default, not in nvidia-smi's
+PCI order, so `CUDA0` is often not `G0`; the dashboard asks the CUDA driver
+which card each ordinal is, under the server's own `CUDA_VISIBLE_DEVICES` and
+`CUDA_DEVICE_ORDER`. vLLM and SGLang shard the vision tower over the model's
+own GPUs (`vision G0+G1`).
+
 ### Context and MTP
 
 The context bar shows cached, prompt and generated tokens against the window
@@ -317,8 +341,8 @@ verdict names RAM as the bound at 2.5 tok/s.</sub>
 |---|---|---|
 | DISK | MB/s read from every whole block device | `/proc/diskstats`, plus the server's own reads and major page faults from `/proc/<pid>/io` and `/proc/<pid>/stat` |
 | RAM | GB/s of weights the CPU streams out of system RAM, *estimate* | CPU-side bytes × active fraction × steps/s; CPU-side bytes = GGUF size minus what the cards hold |
-| PCIe | host→device MB/s per GPU, scaled to the link (gen × lanes) | `nvidia-smi dmon -s t` |
-| VRAM | memory-controller busy % per GPU, plus the estimated GB/s of weights streamed | `nvidia-smi utilization.memory`; bytes per step from the GGUF tensor table |
+| PCIe | host→device MB/s per GPU, scaled to the link (gen × lanes) | `nvidia-smi dmon -s t` (NVIDIA; unavailable for AMD) |
+| VRAM | memory-controller busy % per GPU, plus the estimated GB/s of weights streamed | NVIDIA `utilization.memory` or AMD `mem_busy_percent`; bytes per step from the GGUF tensor table |
 | PREFILL | prompt tokens/s | `/slots` |
 | DECODE | generated tokens/s | `/slots` |
 
@@ -383,9 +407,11 @@ watched and `--pid A,B` restricts it to named processes.
 | `v` | compare every model side by side |
 | `Tab` / `Shift-Tab` | focus the next / previous model |
 | `1`–`9` | focus that model directly |
-| `t` | cycle theme: defrag, neon, fire, ocean, monochrome |
+| `t` | cycle theme (panel frames, backgrounds and heat maps): defrag, neon, fire, ocean, monochrome, braille (btop-style braille graphs) |
 | `r` | rescan for running servers |
-| `s` | settings screen: change launch options, apply them now or save them as the default |
+| `s` | settings screen (shows the version): change launch options, apply them now or save them as the default |
+| `l` | log viewer: per-model totals and the latest requests from the SQLite log (`r` refreshes) |
+| `c` | decode speed vs context length from the SQLite log, one model at a time (`←` `→` switch model, `r` refreshes) |
 | `q` / `Esc` | quit |
 
 Layouts adapt: the model strip is the first thing shed on a short terminal,
@@ -400,23 +426,26 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 
 | Metric | Source |
 |---|---|
-| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window |
+| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. When that field is absent, delta of `llamacpp:tokens_predicted_total` from `GET /metrics`, anchored at the start of the request. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window. Polls go to the server's `--host` (loopback when it bound `0.0.0.0`) |
 | prefill tok/s | llama.cpp: `n_prompt_tokens_processed`. vLLM: prompt-token counter. SGLang: `total_prefill_uncached_tokens`, or `sglang:realtime_tokens_total{mode="prefill_compute"}` with `--enable-metrics` |
 | time to first token | slot turning busy → first decoded token, quantised to the poll interval |
 | tok/J | decode tok/s ÷ summed GPU power draw |
 | cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—") |
 | request log | one record per `id_task`; averages from accumulated deltas |
-| util, VRAM, power, °C, clocks, fan, PCIe | `nvidia-smi --query-gpu=…` every poll |
-| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads` |
-| layers, heads, experts, MTP depth, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
+| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. On Intel, fan speed is the `xe` driver's hwmon tachometer (RPM); utilization that samples ~0 while clocks are boosted is reconstructed from the clock ratio and marked `~`; PCIe link and an unsupported temperature read blank |
+| system RAM | Linux `/proc/meminfo` (`MemTotal − MemAvailable` in use, `Cached` as page cache) and the server's `VmRSS`; elsewhere the OS memory totals, with no page cache split |
+| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards |
+| layers, heads, experts, MTP layers, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
+| vision encoder | llama.cpp: `modalities.vision` from `GET /props`, else `--mmproj` / `-hf` on the command line or `LLAMA_ARG_MMPROJ` in `/proc/<pid>/environ`. Placement: CPU for `--no-mmproj-offload` or a process with no GPU runtime in `/proc/<pid>/maps`; otherwise `--mmproj-device` or the first GPU device, mapped to a card by the CUDA driver's `cuDeviceGetPCIBusId` (run in a child process with the server's CUDA variables) matched against nvidia-smi's `pci.bus_id`, or by the one card the process occupies. vLLM / SGLang: `vision_config` in `config.json`, on the model's GPUs (none with `--language-model-only`) |
 | layer → GPU | `--tensor-split` proportions |
 | layer activity | utilisation of the GPU the layer lives on, smoothed |
 | expert blocks | real top-k routing from `GET /experts` (patched server), else a deterministic stand-in keyed by layer and token step |
+| MTP / speculative depth (tokens drafted per step) | llama.cpp: `--spec-draft-n-max` (or `--draft-max`) on the command line, else the model's MTP layer count. vLLM: number of per-position acceptance counters. SGLang: `speculative_num_draft_tokens` |
 | MTP acceptance, tok/step, steps/s | deltas of `spec_decode_num_draft_tokens_total`, `…accepted_tokens_total`, `…drafts_total` from `GET /metrics`, 1.5 s window |
 | disk MB/s, faults/s | deltas of sectors read in `/proc/diskstats` (whole disks), `read_bytes` in `/proc/<pid>/io`, `majflt` in `/proc/<pid>/stat` |
 | resident weights | `RssFile` in `/proc/<pid>/status` |
-| PCIe MB/s | `nvidia-smi dmon -s t -c 1` rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
-| VRAM busy % | `utilization.memory` from `nvidia-smi` (memory-controller busy time) |
+| PCIe MB/s | in-process NVML `nvmlDeviceGetPcieThroughput` (`nvidia-smi dmon -s t -c 1` fallback) rx/tx per GPU; samples above the link cap are dropped (dmon emits the odd garbage row) |
+| VRAM busy % | NVIDIA `utilization.memory` or AMD `mem_busy_percent` (memory-controller busy time) |
 | bytes per step, RAM / VRAM GB/s | **estimate**: GGUF tensor table (sizes from offset gaps, summed over every shard of a split file), expert tensors × used/total, embedding and engram tables excluded, split CPU vs GPU by what the cards hold, × steps/s |
 
 Per-request `timings` only appear inside completion responses, which the
@@ -451,6 +480,19 @@ For a systemd unit, a drop-in with two `Environment=` lines is enough; see
 at start and after `r`, and stops asking after three failures, so unpatched
 servers cost nothing.
 
+### API keys and LM Studio
+
+A llama-server started with `--api-key` or `--api-key-file` answers `/slots`,
+`/metrics` and `/props` with 401. The dashboard reads the key from that
+server's command line and sends it as a bearer token, so no setup is needed.
+If the key is not on the command line, `--api-key-file` supplies one for
+every server.
+
+LM Studio starts every model it loads as such a llama-server, with its own
+port and key, so press `r` after it loads a different model. It has no switch
+for `--metrics`, but the llama-server it starts inherits its environment:
+launch LM Studio with `LLAMA_ARG_ENDPOINT_METRICS=1` set to get the MTP panel.
+
 ### SGLang
 
 SGLang is detected from `python -m sglang.launch_server` (and the `sglang`
@@ -482,14 +524,18 @@ MTP.
 ```
 --demo               synthetic servers and GPUs; exercises every panel
 --demo-models N      how many synthetic servers --demo runs (default 2)
---model <id|auto>    `auto` (default) observes the running servers;
+--endpoint <url>     inference server endpoint URL (e.g. http://localhost:7000/v1)
+--model <id|url|auto>`auto` (default) observes running servers or local endpoints;
+                     an HTTP URL attaches to that inference endpoint;
                      an HF id streams real attention via the Python bridge
 --max-models N       most models to watch at once (default 8)
 --pid A,B            only watch these PIDs (default: every model found)
---gpu 0,1            nvidia-smi indices to show (default: all)
---poll-ms 200        sampling interval for the server and nvidia-smi
+--gpu 0,1            GPU indices to show (default: all)
+--no-nvml            use nvidia-smi subprocesses instead of native NVML telemetry
+--poll-ms 200        sampling interval for the server and GPU telemetry
+--api-key-file PATH  bearer token file for inference-server HTTP requests
 --color auto|truecolor|256
---theme defrag|neon|fire|ocean|monochrome
+--theme defrag|neon|fire|ocean|monochrome|braille
 --max-layers N, --max-heads N     caps for the attention view
 --log-db auto|off|FILE  SQLite log of samples and requests (default: auto)
 --log-every 1.0      seconds between --log-db sample rows
@@ -497,6 +543,12 @@ MTP.
 ```
 
 `llm-visuals --help` lists everything.
+
+When the inference server requires authentication, point `--api-key-file` at
+a file containing only the bearer token. The token is read at launch, is never
+stored in saved settings or the metrics database, and is attached to all HTTP
+probes made to the detected inference server. Keep the file readable only by
+the account running the dashboard.
 
 ### Settings screen and saved defaults
 
@@ -530,6 +582,19 @@ uses WAL, so it can be queried while the dashboard runs. Once the data passes
 `--log-db-max-mb` (1 GB by default) the oldest tenth of each table is deleted;
 SQLite reuses the freed pages, so the file stops growing at about that size.
 
+Press `l` for a read-only view of the file: row counts, the time span
+covered, per-model request totals with average decode rate and TTFT, and the
+newest requests. With logging off it shows the default file from earlier
+sessions. Press `c` to see how decode speed falls as the context fills: the mean
+decode tok/s of every logged sample, grouped into about a dozen context-length
+ranges per model, with the change from the shortest to the longest range. Only
+samples taken while the model was decoding count; ones that overlap a prefill
+are left out, since their one-second window is partly empty. Ranges with fewer
+than five samples are dimmed. It opens on the focused model; `←` / `→` switch
+to the others in the file.
+
+For anything else, query it directly:
+
 ```sh
 sqlite3 ~/.local/share/llm-visuals/llm.db "SELECT model, AVG(avg_decode_tps) FROM requests GROUP BY model"
 ```
@@ -555,6 +620,11 @@ failing: the NVIDIA userspace was upgraded under a running kernel module.
 Reload the modules or reboot. The panel shows whatever `nvidia-smi` prints so
 the cause is visible.
 
+**AMD GPU panel is unavailable.** AMD telemetry requires Linux with the
+`amdgpu` driver and readable DRM sysfs/hwmon files under `/sys/class/drm`.
+No ROCm installation or privileged access is required. On other operating
+systems the dashboard continues to use the existing NVIDIA collector.
+
 **MTP panel says "start llama-server with --metrics".** Exactly that; see
 above.
 
@@ -567,9 +637,10 @@ nothing to route.
 **Colours look flat.** Your terminal did not advertise truecolor. Run with
 `--color truecolor`, or export `COLORTERM=truecolor`.
 
-**PCIe strip says "nvidia-smi dmon unavailable".** The driver does not
-report PCIe counters for this card, or `dmon` failed three times in a row;
-the other stages still work. Press `r` to retry.
+**PCIe strip says "PCIe throughput unavailable".** Live PCIe throughput is
+currently NVIDIA-only. The driver may not report it for a particular NVIDIA
+card, and AMD cards still show their link generation and width but not live
+PCIe traffic. The other stages continue to work. Press `r` to retry.
 
 **RAM strip says "no tensor table".** The model path on the server's command
 line could not be opened as a GGUF (ollama blobs, remote paths, or a
@@ -606,8 +677,8 @@ this is what you are hitting. Running the server with `-np 1` avoids it.
 
 `docs/ARCHITECTURE.md` has the module map and data contracts. In short:
 one poller per model reads its `/slots`, `/metrics` and `/experts` while
-shared collectors read `nvidia-smi` and the host's `/proc` counters every
-200 ms into channels; samples are tagged with the model's PID, and the frame
+shared collectors read NVIDIA, AMD or Intel GPU telemetry and the host's `/proc`
+counters every 200 ms into channels; samples are tagged with the model's PID, and the frame
 loop routes each into that model's `PerfTracker` (sliding-window rates,
 request lifecycle, peak hold) and `FadeState` (attack/release smoothing,
 expert heat), then renders with ratatui at about 30 fps. Tests cover every
@@ -619,10 +690,11 @@ src/
 ├── render.rs        panels, gauges, sparklines, big digits
 ├── perf.rs          rates, TTFT, request records, MTP stats, VU meters
 ├── bandwidth.rs     weight layout and the bottleneck verdict
-├── host.rs          /proc disk, faults, RSS; nvidia-smi dmon PCIe
+├── host.rs          /proc disk, faults, RSS; in-process NVML PCIe (dmon fallback)
 ├── fade.rs          smoothing and expert heat
 ├── observe.rs       /slots, /metrics, /experts parsers
-├── gpu.rs           nvidia-smi collector, demo GPUs
+├── gpu.rs           NVIDIA/AMD/Intel collectors, demo GPUs
+├── nvml.rs          in-process NVML driver bindings & PCIe throughput
 ├── model_detect.rs  finds the servers, parses their command lines
 ├── gguf.rs          GGUF header reader, layer → GPU mapping
 ├── demo.rs          synthetic servers for --demo
