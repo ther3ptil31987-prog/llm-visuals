@@ -3,7 +3,7 @@
 **A live terminal dashboard for the LLM running on your machine.**
 
 It finds the inference servers you already have up (llama.cpp `llama-server`,
-ollama, vLLM, SGLang, …), reads their counters and NVIDIA, AMD or Intel
+ollama, vLLM, SGLang, Strata, …), reads their counters and NVIDIA, AMD or Intel
 GPU telemetry, and turns them into a truecolor picture of what the model is doing
 right now: tokens per second, time to first token, GPU load and memory, context fill, speculative-decoding
 acceptance, which layers are busy on which GPU, and, with a small server patch,
@@ -426,15 +426,15 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 
 | Metric | Source |
 |---|---|
-| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. When that field is absent, delta of `llamacpp:tokens_predicted_total` from `GET /metrics`, anchored at the start of the request. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. 1 s sliding window. Polls go to the server's `--host` (loopback when it bound `0.0.0.0`) |
-| prefill tok/s | llama.cpp: `n_prompt_tokens_processed`. vLLM: prompt-token counter. SGLang: `total_prefill_uncached_tokens`, or `sglang:realtime_tokens_total{mode="prefill_compute"}` with `--enable-metrics` |
-| time to first token | slot turning busy → first decoded token, quantised to the poll interval |
+| decode tok/s | llama.cpp: delta of `n_decoded` from `GET /slots`. When that field is absent, delta of `llamacpp:tokens_predicted_total` from `GET /metrics`, anchored at the start of the request. vLLM: `/metrics` generation counter. SGLang: `decode_moments[5]` from `GET /v1/loads`. Strata: `live.generated` from `GET /metrics`. 1 s sliding window. Polls go to the server's `--host` (loopback when it bound `0.0.0.0`) |
+| prefill tok/s | llama.cpp: `n_prompt_tokens_processed`. vLLM: prompt-token counter. SGLang: `total_prefill_uncached_tokens`, or `sglang:realtime_tokens_total{mode="prefill_compute"}` with `--enable-metrics`. Strata: `live.prompt_read` from `GET /metrics` |
+| time to first token | slot turning busy → first decoded token, quantised to the poll interval. Strata: the finished request's `prompt_ms`, the server's time reading the new prompt tokens (time spent queued is not in it) |
 | tok/J | decode tok/s ÷ summed GPU power draw |
-| cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—") |
+| cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—"). Strata: the finished request's `reused`, unknown ("—") while it runs |
 | request log | one record per `id_task`; averages from accumulated deltas |
-| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. On Intel, fan speed is the `xe` driver's hwmon tachometer (RPM); utilization that samples ~0 while clocks are boosted is reconstructed from the clock ratio and marked `~`; PCIe link and an unsupported temperature read blank |
+| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. On Intel, fan speed is the `xe` driver's hwmon tachometer (RPM); utilization that samples ~0 while clocks are boosted is reconstructed from the clock ratio and marked `~`; PCIe link and an unsupported temperature read blank. Unified-memory parts (NVIDIA GB10 / DGX Spark) report no device memory, fan or memory-busy counter at all: NVML stays the backend for the fields that *do* answer, and the memory bar relabels itself (see `VRAM weights vs KV` and Troubleshooting) |
 | system RAM | Linux `/proc/meminfo` (`MemTotal − MemAvailable` in use, `Cached` as page cache) and the server's `VmRSS`; elsewhere the OS memory totals, with no page cache split |
-| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards |
+| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards. On a part with no device memory (GB10 / DGX Spark) the bar is labelled `UNIFIED`: used = the server's weight + KV + CUDA-graph GiB from `/v1/loads` summed over the models that report it, denominator = system RAM — the pool the accelerator shares. With no server-reported occupancy the row degrades to zeros rather than a stand-in |
 | layers, heads, experts, MTP layers, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
 | vision encoder | llama.cpp: `modalities.vision` from `GET /props`, else `--mmproj` / `-hf` on the command line or `LLAMA_ARG_MMPROJ` in `/proc/<pid>/environ`. Placement: CPU for `--no-mmproj-offload` or a process with no GPU runtime in `/proc/<pid>/maps`; otherwise `--mmproj-device` or the first GPU device, mapped to a card by the CUDA driver's `cuDeviceGetPCIBusId` (run in a child process with the server's CUDA variables) matched against nvidia-smi's `pci.bus_id`, or by the one card the process occupies. vLLM / SGLang: `vision_config` in `config.json`, on the model's GPUs (none with `--language-model-only`) |
 | layer → GPU | `--tensor-split` proportions |
@@ -516,6 +516,26 @@ is shown as "—" rather than 0. Speculative acceptance uses SGLang's own
 arithmetic: accepted = generated − verify steps, drafted = steps × (draft
 tokens − 1). A separate draft model titles the panel SPECULATIVE rather than
 MTP.
+
+### Strata
+
+[Strata](https://github.com/Niko1221/Strata) is detected from
+`serve/server.py --engine strata`, on its `--port` (8095 when absent). The
+model name, the first GGUF shard (`--native`) and `--max-context` are read
+from the `--config` JSON, so the header shows the model's layers and experts.
+The native `strata --serve` child holds the GPU memory and is folded into the
+server process.
+
+Everything live comes from Strata's JSON `GET /metrics`, polled no faster
+than every 400 ms. Prefill progress and generated tokens come from `live`;
+the prefix reuse and the server's own prefill and decode times are only
+known once a request ends, so while one runs cache hit shows "—". A
+batching engine (`live.parallel`) is followed by its newest request. The MTP
+depth is `engine.mtp_max`. From Strata 0.1.35 the acceptance gauge comes
+from the `totals.drafts_offered` / `drafts_accepted` counters; they move only
+when a request ends, so the gauge shows each finished request's acceptance
+(spread over its server-measured decode time) and holds it until the next. The VRAM weights/KV split is the usual
+file-size estimate, which does not fit Strata's RAM-resident experts.
 
 ---
 
@@ -619,6 +639,21 @@ name the process with `--pid`.
 failing: the NVIDIA userspace was upgraded under a running kernel module.
 Reload the modules or reboot. The panel shows whatever `nvidia-smi` prints so
 the cause is visible.
+
+**Fewer GPU fields on a GB10 / DGX Spark (unified-memory) machine.** Nothing is
+broken: the driver exposes no device memory, no fan tachometer and no
+memory-controller counter there. The GPU panel stays on in-process NVML for
+utilisation, power, temperature and clocks; the VRAM bar becomes `UNIFIED` with
+system RAM as the denominator and the SGLang server's own
+`memory.weight_gb + kv_cache_gb + graph_gb` from `/v1/loads` as the fill (other
+engines do not report occupancy, so the bar shows zeros). Fan and `VRAM busy %`
+read as absent, not as errors. The two bars show the same pool at different
+units and different scopes: `UNIFIED` is GiB like every VRAM bar and counts
+only what the servers report as model occupancy; the `RAM` row is decimal GB
+(`/ 1e9`) and counts the whole system (`MemTotal − MemAvailable`). The same
+119.6 GiB pool is 128.5 G and 119 GiB to btop. The `b` memory pipeline's PCIe
+and VRAM stages have no hardware to measure on a unified part — do not blame
+them for a decode bottleneck.
 
 **AMD GPU panel is unavailable.** AMD telemetry requires Linux with the
 `amdgpu` driver and readable DRM sysfs/hwmon files under `/sys/class/drm`.

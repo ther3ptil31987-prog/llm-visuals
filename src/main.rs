@@ -16,6 +16,7 @@ mod pipeline;
 mod render;
 mod settings;
 mod sglang;
+mod strata;
 mod vision;
 mod vllm;
 
@@ -361,6 +362,41 @@ async fn poll_server(
             tokio::time::sleep(sleep).await;
         }
     }
+    if model.engine == "strata" {
+        // Strata has no /slots or Prometheus counters: its /metrics is one
+        // JSON document from a Python server, so never poll it faster than
+        // 400 ms.
+        let delay = poll.max(Duration::from_millis(400));
+        let mut misses = 0u32;
+        loop {
+            if let Some(m) = strata::poll_metrics(&model.host, port, &auth).await {
+                misses = 0;
+                let mut stats = strata::live_stats(&m);
+                if stats.ctx_max == 0 {
+                    stats.ctx_max = model.ctx_max.unwrap_or(0);
+                }
+                let _ = live_tx.try_send((pid, stats));
+                if let Some(sp) = m.spec {
+                    let _ = spec_tx.try_send((pid, sp));
+                }
+            } else {
+                misses = misses.saturating_add(1);
+                if misses == 3 {
+                    let stats = LiveStats {
+                        ctx_max: model.ctx_max.unwrap_or(0),
+                        ..Default::default()
+                    };
+                    let _ = live_tx.try_send((pid, stats));
+                }
+            }
+            let sleep = if misses >= 3 {
+                delay.max(Duration::from_secs(2))
+            } else {
+                delay
+            };
+            tokio::time::sleep(sleep).await;
+        }
+    }
     if model.engine == "vllm" {
         // vLLM has no /slots or /experts endpoints; its /metrics counters
         // drive the live stats and the MTP panel. The 'r' rescan drops
@@ -475,7 +511,7 @@ fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
     match slots.len() {
         0 => format!(
-            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang) — press r to rescan"
+            "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang / Strata) — press r to rescan"
         ),
         1 => format!("{prefix}attached to {}", slots[0].model),
         n => format!(
@@ -664,6 +700,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut latest_gpu: Vec<GpuStats> = Vec::new();
     let mut gpu_error: Option<String> = None;
+    // System RAM total: the denominator for the VRAM bar on machines
+    // without device memory (GB10 / DGX Spark). The host monitor learns it
+    // on its first sample.
+    let mut sys_ram_total_mb: Option<u64> = None;
     if let Some(backend) = &gpu_backend {
         match GpuMonitor::collect_once(backend) {
             Ok(stats) => latest_gpu = gpu::filter_gpus(stats, &args.gpu_indices()),
@@ -938,6 +978,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(batch) = host_rx.try_recv() {
             ui_changed = true;
             for (pid, h) in batch {
+                sys_ram_total_mb =
+                    sys_ram_total_mb.or(h.mem_total_bytes.map(|b| b / (1024 * 1024)));
                 if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                     slot.perf.observe_host(&h, now);
                 } else if pid == 0 {
@@ -1020,6 +1062,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let frame_dt = (now - last_frame).as_secs_f32().clamp(0.0, 1.0);
         last_frame = now;
+        // Unified-memory parts (GB10 / DGX Spark) have no device memory to
+        // show: build their VRAM bar from the servers' own occupancy report
+        // over system RAM. Re-applied every frame because gpu_rx replaces
+        // the sample wholesale on every drain.
+        gpu::apply_unified_memory(
+            &mut latest_gpu,
+            sys_ram_total_mb.unwrap_or(0),
+            server_reported_gb(slots.iter().map(|s| &s.live)),
+        );
         for slot in &mut slots {
             if slot.live.ctx_max == 0 {
                 slot.live.ctx_max = slot.ctx_max;
@@ -1110,6 +1161,19 @@ fn dir_model_bytes(dir: &std::path::Path) -> Option<u64> {
         }
     }
     any.then_some(total)
+}
+
+/// Weight + KV + CUDA-graph GiB as reported by the servers themselves,
+/// summed over the models that report it; `None` when none do. Only used
+/// to synthesise the VRAM bar on cards without device memory — see
+/// `gpu::apply_unified_memory`. A llama.cpp-only box keeps showing zeros.
+fn server_reported_gb<'a>(lives: impl Iterator<Item = &'a LiveStats>) -> Option<f32> {
+    lives.fold(None, |acc: Option<f32>, l| {
+        l.weight_gb
+            .map(|w| w + l.kv_cache_gb.unwrap_or(0.0) + l.graph_gb.unwrap_or(0.0))
+            .map(|part| acc.unwrap_or(0.0) + part)
+            .or(acc)
+    })
 }
 
 fn fade_sample_from_live(
@@ -1255,6 +1319,30 @@ mod tests {
     use clap::Parser;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn server_reported_gb_sums_sglang_memory_only() {
+        // The live GB10 numbers from fixtures/sglang-loads-gb10.json.
+        let sglang = LiveStats {
+            weight_gb: Some(82.172),
+            kv_cache_gb: Some(10.457),
+            graph_gb: Some(0.234),
+            ..Default::default()
+        };
+        // llama.cpp / vLLM report no server-side memory split.
+        let llama = LiveStats::default();
+        let total = server_reported_gb([&sglang, &llama].into_iter()).unwrap();
+        assert!((total - 92.863).abs() < 1e-3);
+        // Nothing reporting it stays None — the bar must not be fabricated.
+        assert!(server_reported_gb(std::iter::once(&llama)).is_none());
+        // Older SGLang without graph_gb: weight + kv only, no invented zero-sum.
+        let no_graph = LiveStats {
+            graph_gb: None,
+            ..sglang.clone()
+        };
+        let total = server_reported_gb(std::iter::once(&no_graph)).unwrap();
+        assert!((total - 92.629).abs() < 1e-3);
+    }
 
     #[test]
     fn dir_model_bytes_sums_weight_shards_only() {

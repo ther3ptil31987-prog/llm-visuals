@@ -338,6 +338,7 @@ impl VllmAdapter {
             cache_unknown: false,
             weight_gb: None,
             kv_cache_gb: None,
+            graph_gb: None,
             kv_tokens: None,
         };
 
@@ -347,6 +348,7 @@ impl VllmAdapter {
             verify_steps: c.spec_drafts as u64,
             n_decode: c.generation_total as u64,
             tokens_predicted: c.generation_total as u64,
+            busy_secs: 0.0,
         });
 
         (s, spec)

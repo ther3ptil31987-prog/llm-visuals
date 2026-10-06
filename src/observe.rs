@@ -119,6 +119,8 @@ pub struct LiveStats {
     pub weight_gb: Option<f32>,
     /// Server-reported KV-cache occupancy in GiB (`memory.kv_cache_gb`).
     pub kv_cache_gb: Option<f32>,
+    /// Server-reported CUDA-graph occupancy in GiB (`memory.graph_gb`).
+    pub graph_gb: Option<f32>,
     /// Tokens currently occupying the KV pool (`num_used_tokens`). When
     /// set, `ctx_used` prefers this over prompt+decoded.
     pub kv_tokens: Option<usize>,
@@ -209,6 +211,10 @@ pub struct SpecMetrics {
     pub verify_steps: u64,
     pub n_decode: u64,
     pub tokens_predicted: u64,
+    /// Cumulative server-measured decode time, for servers whose counters
+    /// move only when a request ends (Strata): the delta then spans this
+    /// long, not the poll interval. 0 = use the poll timing.
+    pub busy_secs: f64,
 }
 
 pub async fn poll_metrics(host: &str, port: u16, auth: &HttpAuth) -> Option<SpecMetrics> {
@@ -430,6 +436,7 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         cache_unknown: false,
         weight_gb: None,
         kv_cache_gb: None,
+        graph_gb: None,
         kv_tokens: None,
     })
 }
