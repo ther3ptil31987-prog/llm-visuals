@@ -393,6 +393,8 @@ impl SglangAdapter {
             kv_cache_gb: c.kv_cache_gb,
             graph_gb: c.graph_gb,
             kv_tokens: Some(used),
+            kv_usage_perc: None,
+            auth_denied: None,
         };
 
         // (generated_total, steps_total) so the caller can apply

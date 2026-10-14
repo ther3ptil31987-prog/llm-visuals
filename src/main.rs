@@ -350,8 +350,12 @@ async fn poll_server(
             } else {
                 misses = misses.saturating_add(1);
                 if misses == 3 {
+                    // A key-guarded server looks identical to a dead one from
+                    // here; name the difference so the UNIFIED zeros say why.
+                    let denied = observe::auth_refusal(&model.host, port, &auth, "/v1/loads").await;
                     let stats = LiveStats {
                         ctx_max: model.ctx_max.unwrap_or(0),
+                        auth_denied: denied,
                         ..Default::default()
                     };
                     let _ = live_tx.try_send((model.key(), stats));
@@ -385,8 +389,10 @@ async fn poll_server(
             } else {
                 misses = misses.saturating_add(1);
                 if misses == 3 {
+                    let denied = observe::auth_refusal(&model.host, port, &auth, "/metrics").await;
                     let stats = LiveStats {
                         ctx_max: model.ctx_max.unwrap_or(0),
+                        auth_denied: denied,
                         ..Default::default()
                     };
                     let _ = live_tx.try_send((pid, stats));
@@ -432,8 +438,10 @@ async fn poll_server(
             } else {
                 misses = misses.saturating_add(1);
                 if misses == 3 {
+                    let denied = observe::auth_refusal(&model.host, port, &auth, "/metrics").await;
                     let stats = LiveStats {
                         ctx_max,
+                        auth_denied: denied,
                         ..Default::default()
                     };
                     let _ = live_tx.try_send((model.key(), stats));
@@ -523,19 +531,44 @@ fn open_db(args: &Args) -> Result<Option<dblog::DbLog>, String> {
 /// How the status line describes what is being watched.
 fn status_for(slots: &[ModelSlot], rescanned: bool) -> String {
     let prefix = if rescanned { "re-scanned: " } else { "" };
+    // A refused server must not pass for an idle one: the same zeros have a
+    // different remedy, and the remedy is a flag on this very command. The
+    // code shown is the one the server sent.
+    const REMEDY: &str = "no valid API key (--api-key-file)";
     match slots.len() {
         0 => format!(
             "{prefix}no running LLM found (llama-server / ollama / vLLM / SGLang / Strata) — press r to rescan"
         ),
-        1 => format!("{prefix}attached to {}", slots[0].model),
-        n => format!(
-            "{prefix}watching {n} models: {}",
-            slots
+        1 => {
+            let note = slots[0]
+                .live
+                .auth_denied
+                .map(|code| format!(" — HTTP {code}: {REMEDY}"))
+                .unwrap_or_default();
+            format!("{prefix}attached to {}{note}", slots[0].model)
+        }
+        n => {
+            let refused: Vec<String> = slots
                 .iter()
-                .map(|s| s.model.short_name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .filter_map(|s| {
+                    let code = s.live.auth_denied?;
+                    Some(format!("{} HTTP {code}", s.model.short_name()))
+                })
+                .collect();
+            let note = if refused.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}: {REMEDY}", refused.join(", "))
+            };
+            format!(
+                "{prefix}watching {n} models: {}{note}",
+                slots
+                    .iter()
+                    .map(|s| s.model.short_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 
@@ -989,7 +1022,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu::apply_unified_memory(
                 &mut latest_gpu,
                 sys_ram_total_mb.unwrap_or(0),
-                server_reported_gb(slots.iter().map(|s| &s.live)),
+                unified_occupancy_gb(&slots),
             );
             // The cards are shared, so every model sees the same samples.
             for slot in &mut slots {
@@ -1038,15 +1071,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        let mut refusal_changed = false;
         while let Ok((pid, s)) = live_rx.try_recv() {
             ui_changed = true;
             if let Some(slot) = slot_of.get(&pid).and_then(|i| slots.get_mut(*i)) {
                 if s.ctx_max > 0 {
                     slot.ctx_max = s.ctx_max;
                 }
+                // Compared slot by slot, so a second server refusing, or one
+                // that comes back after `r` and refuses again, is news too.
+                refusal_changed |= slot.live.auth_denied != s.auth_denied;
                 slot.perf.observe(&s, now);
                 slot.live = s;
             }
+        }
+        if refusal_changed {
+            // A server starting or stopping to refuse our key changes the
+            // story the status line tells; say it while it is news.
+            status = status_for(&slots, false);
         }
 
         while let Ok(event) = events_rx.try_recv() {
@@ -1227,6 +1269,40 @@ fn server_reported_gb<'a>(lives: impl Iterator<Item = &'a LiveStats>) -> Option<
     })
 }
 
+/// What a vLLM server holds, by its own declaration: the safetensors shards
+/// it serves (the same file-size estimate the VRAM split uses) and the
+/// `--kv-cache-memory-bytes` pool it was launched with. vLLM allocates that
+/// pool in one piece at start-up, so all of it is occupied however little of
+/// it holds tokens; `kv_cache_usage_perc` is the share that does, and the
+/// bar lights that much of its KV segment. The flag is per GPU, and a
+/// unified part has one. `None` when neither number is known.
+fn vllm_declared_gb(model: &DetectedModel) -> Option<f32> {
+    if model.engine != "vllm" {
+        return None;
+    }
+    let weights = model
+        .path
+        .as_deref()
+        .filter(|p| p.is_dir())
+        .and_then(dir_model_bytes);
+    let pool = vllm::kv_pool_bytes(&model.cmdline);
+    (weights.is_some() || pool.is_some())
+        .then(|| (weights.unwrap_or(0) + pool.unwrap_or(0)) as f32 / 1024f32.powi(3))
+}
+
+/// Occupancy for the unified-memory bar, summed over the models: what each
+/// server reports through `/v1/loads`, or failing that what a vLLM server
+/// declares. A model with neither adds nothing, and `None` when none has
+/// either: a llama.cpp-only box keeps showing zeros.
+fn unified_occupancy_gb(slots: &[ModelSlot]) -> Option<f32> {
+    slots.iter().fold(None, |acc, s| {
+        server_reported_gb(std::iter::once(&s.live))
+            .or_else(|| vllm_declared_gb(&s.model))
+            .map(|part| acc.unwrap_or(0.0) + part)
+            .or(acc)
+    })
+}
+
 fn fade_sample_from_live(
     detected: Option<&DetectedModel>,
     gpu: &[GpuStats],
@@ -1393,6 +1469,152 @@ mod tests {
         };
         let total = server_reported_gb(std::iter::once(&no_graph)).unwrap();
         assert!((total - 92.629).abs() < 1e-3);
+    }
+
+    #[test]
+    fn unified_occupancy_falls_back_to_vllm_declared_numbers() {
+        let root =
+            std::env::temp_dir().join(format!("llm-visuals-test-unified-{}", std::process::id()));
+        let dir = root.join("model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("model-00001-of-00001.safetensors"),
+            vec![0u8; 4 << 20],
+        )
+        .unwrap();
+
+        let slot = |engine: &str, path: Option<PathBuf>, cmdline: &str, kv: Option<f32>| {
+            let mut s = ModelSlot::new(DetectedModel {
+                name: "m".into(),
+                path,
+                pid: 1,
+                process_name: "vllm".into(),
+                engine: engine.into(),
+                gpu_indices: vec![0],
+                mem_used_mb: 0,
+                host: "127.0.0.1".into(),
+                port: Some(8000),
+                ctx_max: None,
+                spec_type: None,
+                n_gpu_layers: None,
+                tensor_split: vec![],
+                cmdline: cmdline.into(),
+                gguf: None,
+                tensors: None,
+                vision: None,
+            });
+            s.live.kv_usage_perc = kv;
+            s
+        };
+        let declared = "vllm serve /model --kv-cache-memory-bytes 16G";
+        let served = || Some(dir.clone());
+        let shards = 0.00390625; // 4 MiB
+
+        // The shards and the whole declared pool: vLLM allocates it at
+        // start-up, so how much of it holds tokens does not change the sum.
+        let a = slot("vllm", served(), declared, Some(0.25));
+        let gb = unified_occupancy_gb(std::slice::from_ref(&a)).unwrap();
+        assert!((gb - (shards + 16.0)).abs() < 1e-4);
+        let idle = slot("vllm", served(), declared, None);
+        let gb = unified_occupancy_gb(std::slice::from_ref(&idle)).unwrap();
+        assert!((gb - (shards + 16.0)).abs() < 1e-4);
+
+        // Drawn on a GB10 row, that leaves the bar's KV segment as exactly
+        // the pool, which is what lets the server's gauge light a share of it.
+        let mut gpus = [GpuStats {
+            name: "NVIDIA GB10".into(),
+            ..Default::default()
+        }];
+        gpu::apply_unified_memory(
+            &mut gpus,
+            124_518, // 121.6 GiB of system RAM
+            unified_occupancy_gb(std::slice::from_ref(&a)),
+        );
+        assert!(gpus[0].unified);
+        let sample = fade_sample_from_live(Some(&a.model), &gpus, &a.live, fade::KV_BUCKETS);
+        let total_gb = gpus[0].vram_total_gb();
+        assert!((sample.weight_frac[0] * total_gb - shards).abs() < 1e-3);
+        assert!((sample.kv_alloc_frac[0] * total_gb - 16.0).abs() < 1e-2);
+
+        // No declared pool: weight only, no invented KV.
+        let no_pool = slot("vllm", served(), "vllm serve /model", Some(0.25));
+        let gb = unified_occupancy_gb(std::slice::from_ref(&no_pool)).unwrap();
+        assert!((gb - shards).abs() < 1e-4);
+
+        // Unresolvable served dir and no pool: zeros, not a stand-in.
+        let blind = slot(
+            "vllm",
+            Some(PathBuf::from("/nonexistent-llm-visuals")),
+            "vllm serve /model",
+            Some(0.25),
+        );
+        assert!(unified_occupancy_gb(std::slice::from_ref(&blind)).is_none());
+
+        // The flag is vLLM's: another engine's command line is not read for it.
+        let other = slot("llama.cpp", served(), declared, None);
+        assert!(unified_occupancy_gb(std::slice::from_ref(&other)).is_none());
+
+        // Each model counts by its own source: a server that reports
+        // /v1/loads beside a vLLM one, and the bar holds both.
+        let mut sglang = slot("sglang", served(), "sglang --model-path m", None);
+        sglang.live.weight_gb = Some(82.172);
+        sglang.live.kv_cache_gb = Some(10.457);
+        sglang.live.graph_gb = Some(0.234);
+        let gb = unified_occupancy_gb(std::slice::from_ref(&sglang)).unwrap();
+        assert!((gb - 92.863).abs() < 1e-3);
+        let gb = unified_occupancy_gb(&[a, sglang, blind]).unwrap();
+        assert!((gb - (92.863 + shards + 16.0)).abs() < 1e-3);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_names_a_key_guarded_server() {
+        let model = |engine: &str| DetectedModel {
+            name: format!("m-{engine}"),
+            path: None,
+            pid: 1,
+            process_name: engine.into(),
+            engine: engine.into(),
+            gpu_indices: vec![],
+            mem_used_mb: 0,
+            host: "127.0.0.1".into(),
+            port: Some(8000),
+            ctx_max: None,
+            spec_type: None,
+            n_gpu_layers: None,
+            tensor_split: vec![],
+            cmdline: String::new(),
+            gguf: None,
+            tensors: None,
+            vision: None,
+        };
+        let mut refused = ModelSlot::new(model("sglang"));
+        refused.live.auth_denied = Some(401);
+        let ok = ModelSlot::new(model("vllm"));
+
+        let one = status_for(std::slice::from_ref(&refused), false);
+        assert!(
+            one.ends_with(" — HTTP 401: no valid API key (--api-key-file)"),
+            "{one}"
+        );
+        let one = status_for(std::slice::from_ref(&ok), false);
+        assert!(!one.contains("HTTP"), "{one}");
+
+        // The code is the one the server sent, and only a refusing model is named.
+        refused.live.auth_denied = Some(403);
+        let many = status_for(&[refused, ok], false);
+        assert!(
+            many.starts_with("watching 2 models: m-sglang, m-vllm"),
+            "{many}"
+        );
+        assert!(
+            many.ends_with(" — m-sglang HTTP 403: no valid API key (--api-key-file)"),
+            "{many}"
+        );
+
+        // The remedy is an option this command has.
+        assert!(Args::try_parse_from(["llm-visuals", "--api-key-file", "key"]).is_ok());
     }
 
     #[test]

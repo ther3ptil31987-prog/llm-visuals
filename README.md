@@ -297,7 +297,8 @@ the server reported 24.3 tok/s and 412 ms prompt time; the dashboard showed
 ### GPUs
 
 One card per device: utilisation gauge with a VU-style peak-hold notch, power
-gauge, temperature coloured by heat, SM clock, fan, PCIe link, a VRAM bar split
+gauge, temperature coloured by heat (plus the memory temperature on the
+NVIDIA cards that report it), SM clock, fan, PCIe link, a VRAM bar split
 into weights / KV in use / KV reserved / free, and utilisation and power
 history sparklines.
 
@@ -484,7 +485,7 @@ watched and `--pid A,B` restricts it to named processes.
 
 Layouts adapt: the model strip is the first thing shed on a short terminal,
 then the request log, then the context and MTP row, and on narrow terminals
-the GPU line sheds PCIe, fan, clock and temperature before the gauge shrinks,
+the GPU line sheds PCIe, fan, clock and temperatures before the gauge shrinks,
 while the key row shortens its own labels. Truecolor is auto-detected with a
 256-colour fallback.
 
@@ -500,9 +501,9 @@ while the key row shortens its own labels. Truecolor is auto-detected with a
 | tok/J | decode tok/s ÷ summed GPU power draw |
 | cache hit | llama.cpp: `n_prompt_tokens_cache / n_prompt_tokens`. SGLang without `--enable-metrics` is unknown (shown as "—"). Strata: the finished request's `reused`, unknown ("—") while it runs |
 | request log | one record per `id_task`; averages from accumulated deltas |
-| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. On Intel, fan speed is the `xe` driver's hwmon tachometer (RPM); utilization that samples ~0 while clocks are boosted is reconstructed from the clock ratio and marked `~`; PCIe link and an unsupported temperature read blank. Unified-memory parts (NVIDIA GB10 / DGX Spark) report no device memory, fan or memory-busy counter at all: NVML stays the backend for the fields that *do* answer, and the memory bar relabels itself (see `VRAM weights vs KV` and Troubleshooting) |
+| util, VRAM, power, °C, clocks, fan, PCIe link | NVIDIA in-process NVML (`nvidia-smi --query-gpu=…` fallback), Intel `xpu-smi --query-gpu=…`, or Linux amdgpu sysfs and hwmon, every poll. NVIDIA additionally reports the memory temperature — NVML field value 82 on the in-process path, `temperature.memory` on the CLI one — shown as `mem 71°` beside the die temperature on cards whose driver reports the sensor (HBM parts such as the CMP 170HX it was verified on); it reads blank elsewhere. On Intel, fan speed is the `xe` driver's hwmon tachometer (RPM); utilization that samples ~0 while clocks are boosted is reconstructed from the clock ratio and marked `~`; PCIe link and an unsupported temperature read blank. Unified-memory parts (NVIDIA GB10 / DGX Spark) report no device memory, fan or memory-busy counter at all: NVML stays the backend for the fields that *do* answer, and the memory bar relabels itself (see `VRAM weights vs KV` and Troubleshooting) |
 | system RAM | Linux `/proc/meminfo` (`MemTotal − MemAvailable` in use, `Cached` as page cache) and the server's `VmRSS`; elsewhere the OS memory totals, with no page cache split |
-| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards. On a part with no device memory (GB10 / DGX Spark) the bar is labelled `UNIFIED`: used = the server's weight + KV + CUDA-graph GiB from `/v1/loads` summed over the models that report it, denominator = system RAM — the pool the accelerator shares. With no server-reported occupancy the row degrades to zeros rather than a stand-in |
+| VRAM weights vs KV | llama.cpp: **estimate** from GGUF file size × `--tensor-split`. SGLang: `memory.weight_gb` and `memory.kv_cache_gb` from `/v1/loads`. vLLM and other safetensors servers: **estimate** from the summed size of the served directory's weight shards. On a part with no device memory (GB10 / DGX Spark) the bar is labelled `UNIFIED`: used = the server's weight + KV + CUDA-graph GiB from `/v1/loads` summed over the models that report it, denominator = system RAM — the pool the accelerator shares. vLLM has no `/v1/loads`; a vLLM server is counted by its own declared numbers instead: the served directory's shard sizes for weights, plus the whole `--kv-cache-memory-bytes` pool it was launched with, which vLLM allocates at start-up (the value is read as vLLM reads it: `16g` is 16 × 10⁹ bytes, `16G` is 16 GiB). `kv_cache_usage_perc` from `/metrics` lights the share of that pool holding tokens. Without the flag the pool is not counted, and with no number from any model the row degrades to zeros rather than a stand-in |
 | layers, heads, experts, MTP layers, engram, quant | GGUF header, or HuggingFace `config.json` (`num_hidden_layers`, `num_attention_heads`, `num_experts` / `num_local_experts`, `num_experts_per_tok`) for safetensors dirs |
 | vision encoder | llama.cpp: `modalities.vision` from `GET /props`, else `--mmproj` / `-hf` on the command line or `LLAMA_ARG_MMPROJ` in `/proc/<pid>/environ`. Placement: CPU for `--no-mmproj-offload` or a process with no GPU runtime in `/proc/<pid>/maps`; otherwise `--mmproj-device` or the first GPU device, mapped to a card by the CUDA driver's `cuDeviceGetPCIBusId` (run in a child process with the server's CUDA variables) matched against nvidia-smi's `pci.bus_id`, or by the one card the process occupies. vLLM / SGLang: `vision_config` in `config.json`, on the model's GPUs (none with `--language-model-only`) |
 | layer → GPU | `--tensor-split` proportions |
@@ -561,6 +562,16 @@ A Strata server started with a key answers `/metrics` and `/v1/models` with
 401 as well. Reached by `--endpoint` without the key it is still recognised:
 its `/health` is open and names the server, the model and the context. The
 live numbers come from `/metrics`, so they need the key.
+
+An SGLang server started with a key leaves `/metrics` open but answers
+`/v1/loads`, where its numbers come from, with 401. vLLM checks its key only
+on `/v1` and similar API routes, so its `/metrics` needs none. A refused server
+would show the same zeros as an idle one, so when an SGLang, Strata, vLLM or
+NInfer server's numbers are refused three polls running the status line says
+so, with the code the server sent:
+`attached to … — HTTP 401: no valid API key (--api-key-file)`. That happens
+when the key is not on the server's command line, for example an SGLang server
+that reads it from a config file.
 
 LM Studio starts every model it loads as such a llama-server, with its own
 port and key, so press `r` after it loads a different model. It has no switch
@@ -661,6 +672,7 @@ concurrent request traces.
 --log-db auto|off|FILE  SQLite log of samples and requests (default: auto)
 --log-every 1.0      seconds between --log-db sample rows
 --log-db-max-mb 1024 size cap for --log-db; oldest rows are dropped (0 = none)
+--version, -v        print the version and exit
 ```
 
 `llm-visuals --help` lists everything.
@@ -697,8 +709,9 @@ running without logging; an explicit path that fails is an error.
 
 Three tables are written (timestamps are Unix seconds):
 `model_samples` (decode/prefill tok/s, context fill, session totals per model),
-`gpu_samples` (utilisation, VRAM, power, temperature per card) and `requests`
-(one row per finished request: tokens, TTFT, duration, average rates). The file
+`gpu_samples` (utilisation, VRAM, power, die and memory temperature per card)
+and `requests` (one row per finished request: tokens, TTFT, duration, average
+rates). The file
 uses WAL, so it can be queried while the dashboard runs. Once the data passes
 `--log-db-max-mb` (1 GB by default) the oldest tenth of each table is deleted;
 SQLite reuses the freed pages, so the file stops growing at about that size.
@@ -746,9 +759,17 @@ broken: the driver exposes no device memory, no fan tachometer and no
 memory-controller counter there. The GPU panel stays on in-process NVML for
 utilisation, power, temperature and clocks; the VRAM bar becomes `UNIFIED` with
 system RAM as the denominator and the SGLang server's own
-`memory.weight_gb + kv_cache_gb + graph_gb` from `/v1/loads` as the fill (other
-engines do not report occupancy, so the bar shows zeros). Fan and `VRAM busy %`
-read as absent, not as errors. The two bars show the same pool at different
+`memory.weight_gb + kv_cache_gb + graph_gb` from `/v1/loads` as the fill.
+
+vLLM reports no `/v1/loads`; its fill is the served directory's shard sizes
+plus the `--kv-cache-memory-bytes` pool from its command line, all of which
+vLLM allocates at start-up, and `kv_cache_usage_perc` lights the part of the
+pool that holds tokens. A vLLM server launched without that flag sizes its
+pool by profiling, and only its weights are counted. llama.cpp reports
+neither, so its bar shows zeros. An SGLang server whose key the dashboard does
+not have shows zeros too, and the status line says `HTTP 401` (see
+[API keys and LM Studio](#api-keys-and-lm-studio)). Fan and `VRAM busy %` read
+as absent, not as errors. The two bars show the same pool at different
 units and different scopes: `UNIFIED` is GiB like every VRAM bar and counts
 only what the servers report as model occupancy; the `RAM` row is decimal GB
 (`/ 1e9`) and counts the whole system (`MemTotal − MemAvailable`). The same
