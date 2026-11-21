@@ -100,6 +100,10 @@ pub struct StrataMetrics {
     pub tiers: Option<ExpertTiers>,
     /// Maya's `gpu_map`, summed over its cards.
     pub vram: Option<VramSplit>,
+    /// `engine.model_label`, e.g. `DeepSeek V4.1 · EXL3 2.9 bpw`.
+    pub label: Option<String>,
+    /// `engine.cpu_threads`: the threads Maya's CPU lane computes with.
+    pub cpu_threads: Option<u32>,
 }
 
 /// Where a Maya engine found the experts its tokens routed to (`tiers.now`,
@@ -118,8 +122,44 @@ pub struct ExpertTiers {
     pub vram_slots: Option<usize>,
     pub ram_used: Option<usize>,
     pub ram_slots: Option<usize>,
+    /// Tokens per second over the window these per-token counts cover.
+    pub tok_s: Option<f32>,
+    /// Experts resident in system RAM (`cpu_n`, DeepSeek's CPU lane).
+    pub cpu_n: Option<usize>,
+    /// Size of that RAM pool, GiB (`ram_gb`).
+    pub ram_gb: Option<f32>,
     /// The engine's recent `vram_hit` readings, oldest first.
     pub hit_history: Vec<f32>,
+}
+
+impl ExpertTiers {
+    /// Weights the engine reads out of system RAM, GB/s (10^9 bytes):
+    ///
+    /// ```text
+    /// experts per token  x  bytes per expert  x  tokens per second
+    /// ```
+    ///
+    /// - Experts per token: `cpu`, the experts the CPU lane computed from RAM
+    ///   (DeepSeek); where the engine has no CPU lane, `ram_fetch`, the experts
+    ///   it read out of RAM to move them to a card (GLM). Both are read out of
+    ///   the same pool, once per token.
+    /// - Bytes per expert: the RAM pool (`ram_gb`, GiB) over the experts it
+    ///   holds (`ram_slots`, else `cpu_n`, else `ram_used`). Checked against
+    ///   the card side: GLM's pool over its slots is 7.116 MB either way, the
+    ///   size of a VRAM slot (`gpu_map` pool over `slots`).
+    /// - Tokens per second: the `tok_s` of the same window as the counts,
+    ///   not the live rate, which averages over another span.
+    ///
+    /// An upper bound under speculative decoding, where a verify step may
+    /// read an expert once for several tokens. `None` when any factor is
+    /// missing. Idle readings are stale; the caller gates on the phase.
+    pub fn ram_stream_gb_s(&self) -> Option<f32> {
+        let per_token = self.cpu.or(self.ram_fetch)?;
+        let slots = self.ram_slots.or(self.cpu_n).or(self.ram_used)?;
+        let bytes = self.ram_gb? as f64 * (1u64 << 30) as f64 / slots.max(1) as f64;
+        let gb_s = per_token as f64 * bytes * self.tok_s? as f64 / 1e9;
+        (gb_s.is_finite() && gb_s >= 0.0).then_some(gb_s as f32)
+    }
 }
 
 /// What the engine says fills its cards, GiB (`gpu_map[].parts`).
@@ -157,6 +197,9 @@ fn parse_tiers(v: &Value) -> Option<ExpertTiers> {
         vram_slots: usize_at(now, "vram_slots"),
         ram_used: usize_at(now, "ram_used"),
         ram_slots: usize_at(now, "ram_slots"),
+        tok_s: f("tok_s").filter(|x| *x >= 0.0),
+        cpu_n: usize_at(now, "cpu_n"),
+        ram_gb: f("ram_gb").filter(|x| *x > 0.0),
         hit_history,
     })
 }
@@ -254,6 +297,14 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
             .map(str::to_string),
         tiers: v.get("tiers").and_then(parse_tiers),
         vram: v.get("gpu_map").and_then(parse_gpu_map),
+        label: engine
+            .get("model_label")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        cpu_threads: usize_at(engine, "cpu_threads")
+            .filter(|n| *n > 0)
+            .map(|n| n as u32),
     })
 }
 
@@ -351,6 +402,8 @@ pub fn live_stats(m: &StrataMetrics) -> LiveStats {
             0.0
         }),
         tiers: m.tiers.clone(),
+        engine_label: m.label.clone(),
+        engine_threads: m.cpu_threads,
         weight_gb: m.vram.map(|v| v.weights_gb),
         kv_cache_gb: m.vram.map(|v| v.kv_gb),
         graph_gb: m.vram.map(|v| v.other_gb),
@@ -453,14 +506,30 @@ fn argv0_base(process_name: &str, cmdline: &str) -> String {
         .unwrap_or(base)
 }
 
-/// `serve/server.py --engine strata`: the process that serves HTTP.
+/// `serve/server.py --engine strata` (or Maya's `--engine maya`): the
+/// process that serves HTTP.
 pub fn is_server(cmdline: &str) -> bool {
+    server_engine(cmdline).is_some()
+}
+
+/// The `--engine` a Strata-family `serve/server.py` was started with:
+/// `strata` or `maya`. Newer Maya servers (the Hy4 engine) name themselves.
+pub fn server_engine(cmdline: &str) -> Option<&'static str> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
-    toks.iter().enumerate().any(|(i, t)| {
-        *t == "--engine=strata" || (*t == "--engine" && toks.get(i + 1) == Some(&"strata"))
-    }) && toks
+    if !toks
         .iter()
         .any(|t| Path::new(t).file_name().is_some_and(|f| f == "server.py"))
+    {
+        return None;
+    }
+    toks.iter().enumerate().find_map(|(i, t)| {
+        let v = t.strip_prefix("--engine=").or_else(|| {
+            (*t == "--engine")
+                .then(|| toks.get(i + 1).copied())
+                .flatten()
+        })?;
+        ["strata", "maya"].into_iter().find(|e| *e == v)
+    })
 }
 
 /// The native `strata --serve` child (Maya's `maya` / `maya-ds4`). It holds
@@ -572,11 +641,16 @@ fn sources_gguf(pack: &Path) -> Option<PathBuf> {
         .as_array()?
         .iter()
         .filter_map(|f| f.get("name")?.as_str())
-        .filter(|n| n.ends_with(".gguf"))
+        .filter(|n| n.ends_with(".gguf") && !is_mmproj(n))
         .collect();
     // `-00001-of-` sorts first; the header is in that shard.
     names.sort_unstable();
     Some(pack.parent()?.join(names.first()?))
+}
+
+/// A vision projector (`mmproj-….gguf`) listed beside the model's shards.
+fn is_mmproj(name: &str) -> bool {
+    name.to_lowercase().starts_with("mmproj")
 }
 
 /// `tensors.txt` opens with `file <n> <name>` lines (the model's shards, then
@@ -600,7 +674,7 @@ fn ds4_gguf(pack: &Path) -> Option<PathBuf> {
             (t.next() == Some("file")).then_some(())?;
             let n: u32 = t.next()?.parse().ok()?;
             let name = t.next()?.to_string();
-            name.ends_with(".gguf").then_some((n, name))
+            (name.ends_with(".gguf") && !is_mmproj(&name)).then_some((n, name))
         })
         .min()?
         .1;
@@ -1028,6 +1102,10 @@ mod tests {
     fn recognises_server_and_engine() {
         assert!(is_server(SERVER));
         assert!(is_server("python /x/serve/server.py --engine=strata"));
+        assert!(is_server(
+            "python /x/serve/server.py --engine maya --config /x/c.json"
+        ));
+        assert!(is_server("python /x/serve/server.py --engine=maya"));
         assert!(!is_server("python serve/server.py --engine mock"));
         assert!(!is_server("vim strata"));
         assert!(is_engine("strata", ENGINE));
@@ -1072,6 +1150,26 @@ mod tests {
     }
 
     #[test]
+    fn maya_hy4_metrics_carry_the_tiers_without_a_gpu_map() {
+        // A real Maya 1.1.70 reply (Hy4-Flash · Maya-M on one card),
+        // histories cut. Hy4 computes most experts on the CPU and reports
+        // no gpu_map.
+        let body = std::fs::read_to_string("fixtures/maya-hy4-metrics.json").unwrap();
+        let m = parse_metrics(&body).unwrap();
+        assert_eq!(m.maya_version.as_deref(), Some("1.1.70"));
+        assert_eq!(m.model.as_deref(), Some("Hy4-flash"));
+        assert_eq!(m.max_context, 32768);
+        assert_eq!(m.requests_done, 1);
+        let t = m.tiers.unwrap();
+        assert!(t.vram_hit.is_some_and(|h| h > 0.0 && h < 0.1));
+        assert!(t.cpu.is_some_and(|c| c > 600.0));
+        assert_eq!((t.ram_fetch, t.disk, t.promo), (None, None, None));
+        assert_eq!(t.hit_history.len(), 4);
+        assert_eq!(m.vram, None);
+        assert_eq!(m.spec, None);
+    }
+
+    #[test]
     fn maya_health_is_recognised_by_its_shape() {
         // serve/server.py's /health in Maya 1.1.25, as served.
         let h = parse_health(
@@ -1105,6 +1203,48 @@ mod tests {
         assert!(is_helper("maya-vision", vision));
         assert!(!is_helper("maya", glm));
         assert!(is_family("maya") && is_family("strata") && !is_family("vllm"));
+    }
+
+    #[test]
+    fn recognises_a_maya_hy4_server_and_engine() {
+        // Maya 1.1.70 serving Hy4-Flash: the server names its engine `maya`.
+        let server = "/opt/maya/.venv/bin/python /opt/maya/serve/server.py --engine maya \
+                      --config /opt/maya/maya-hy4-flash-maya-m.json --port 8081 --parent-pipe";
+        let engine = "/opt/maya/build/maya-hy4 --serve --pack /m/Hy4-Flash-Maya-M/maya-hy4 \
+                      --max-context 32768 --dfly2";
+        assert!(is_server(server));
+        assert_eq!(server_engine(server), Some("maya"));
+        assert_eq!(
+            server_engine("python serve/server.py --engine=strata"),
+            Some("strata")
+        );
+        assert_eq!(server_engine("python serve/server.py --engine vllm"), None);
+        // The launcher beside it takes the same --config but serves nothing.
+        assert!(!is_server(
+            "python /opt/maya/maya.py --config c.json --port 8081"
+        ));
+        assert!(is_engine("maya-hy4", engine));
+    }
+
+    #[test]
+    fn hy4_pack_skips_the_vision_projector() {
+        let dir = std::env::temp_dir().join(format!("lv-hy4-pack-{}", std::process::id()));
+        let pack = dir.join("maya-hy4");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("sources.json"),
+            r#"{"files": [
+                {"name": "mmproj-Hy4-Flash-Maya-XS.gguf"},
+                {"name": "Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf"},
+                {"name": "Hy4-Flash-Maya-M-drafter.dfly2"},
+                {"name": "Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pack_gguf(&pack),
+            Some(dir.join("Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1212,5 +1352,57 @@ mod tests {
             config_path(SERVER, Some(Path::new("/srv/strata"))),
             Some(PathBuf::from("/srv/strata/strata-iq2_xs.json"))
         );
+    }
+
+    #[test]
+    fn maya_ds4_streams_its_cpu_lane_out_of_ram() {
+        // A real Maya 1.1.53 reply (DeepSeek V4.1, two RTX 3090s) mid-answer.
+        let body = std::fs::read_to_string("fixtures/maya-metrics-ds4.json").unwrap();
+        let m = parse_metrics(&body).unwrap();
+        assert_eq!(m.maya_version.as_deref(), Some("1.1.53"));
+        assert_eq!(
+            m.label.as_deref(),
+            Some("DeepSeek V4.1 \u{b7} EXL3 2.9 bpw")
+        );
+        assert_eq!(m.cpu_threads, Some(14));
+        let t = m.tiers.as_ref().unwrap();
+        assert!((t.cpu.unwrap() - 70.042).abs() < 1e-3);
+        assert_eq!(t.cpu_n, Some(14133));
+        assert_eq!(t.ram_slots, None, "DeepSeek reports no RAM slot count");
+        assert!((t.ram_gb.unwrap() - 181.4).abs() < 1e-3);
+        assert!((t.tok_s.unwrap() - 20.35).abs() < 1e-3);
+        // 70.042 experts/token x (181.4 GiB / 14133 experts) x 20.35 tok/s.
+        let want = 70.042 * (181.4 * 1073741824.0 / 14133.0) * 20.35 / 1e9;
+        let got = t.ram_stream_gb_s().unwrap() as f64;
+        assert!((got - want).abs() < 0.01, "{got} vs {want}");
+        assert!((got - 19.6).abs() < 0.2, "{got}");
+        let s = live_stats(&m);
+        assert_eq!(s.engine_label, m.label);
+        assert_eq!(s.engine_threads, Some(14));
+    }
+
+    #[test]
+    fn maya_glm_streams_the_experts_it_fetches_from_ram() {
+        // No CPU lane: `ram_fetch` is what the engine reads out of RAM, and
+        // the pool's own slot count sizes an expert (7.116 MB, the size of a
+        // VRAM slot: gpu_map pool 7528895616 B over 1058 slots).
+        let body = std::fs::read_to_string("fixtures/maya-metrics.json").unwrap();
+        let m = parse_metrics(&body).unwrap();
+        assert_eq!(m.label, None);
+        assert_eq!(m.cpu_threads, Some(24));
+        let t = m.tiers.unwrap();
+        assert_eq!(t.cpu, None);
+        let got = t.ram_stream_gb_s().unwrap();
+        assert!((got - 5.85).abs() < 0.05, "{got}");
+        // Any missing factor, no figure.
+        let mut none = t.clone();
+        none.tok_s = None;
+        assert_eq!(none.ram_stream_gb_s(), None);
+        let mut none = t.clone();
+        none.ram_gb = None;
+        assert_eq!(none.ram_stream_gb_s(), None);
+        let mut none = t;
+        none.ram_fetch = None;
+        assert_eq!(none.ram_stream_gb_s(), None);
     }
 }

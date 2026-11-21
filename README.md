@@ -1053,11 +1053,13 @@ file-size estimate, which does not fit Strata's RAM-resident experts.
 Project Maya, built on Strata, runs the same `serve/server.py --engine
 strata` front end (port 8080 in its own configs) with its own engine,
 `maya --serve --glm-pack <pack>` (`maya-ds4 --serve --pack <pack>` for
-DeepSeek). A config whose `exe` is `maya…`, a `/metrics` that carries
+DeepSeek, `maya-hy4 --serve --pack <pack>` for Hy4-Flash, whose server is
+started as `--engine maya`). A config whose `exe` is `maya…`, a `/metrics` that carries
 `engine.maya_version`, or a `/health` with Maya's `version` and `mcp_tools`
 keys names the engine `maya` in the header; everything Strata's section says
 holds for it too. The header's layers and experts come from the first GGUF
-shard `pack/sources.json` lists (the shards sit beside the pack), and the
+shard `pack/sources.json` lists (the shards sit beside the pack; a vision
+projector `mmproj-….gguf` listed with them is skipped), and the
 cards from the config's `gpu` list when the driver lists no GPU processes.
 The `maya-vision` encoder the server starts beside the engine holds GPU
 memory but serves no API; it is folded into the server, and the header's
@@ -1069,7 +1071,7 @@ the `gpu_map` parts `weights`, `pool` (the VRAM expert cache), `drafter`,
 the remainder. Its `tiers` block adds an **expert tiers** panel above the
 expert map: the share of routed experts found in VRAM (with its history),
 experts per token fetched from RAM, read from SSD (amber from 0.05 per token,
-when the pack no longer fits in RAM), promoted into VRAM and, for DeepSeek,
+when the pack no longer fits in RAM), promoted into VRAM and, for DeepSeek and Hy4,
 run on the CPU, and how full the VRAM and RAM expert slots are. Between
 requests it holds the last request's figures and says so. The panel needs
 nine rows of expert area; on a shorter terminal only the map is drawn.
@@ -1181,6 +1183,11 @@ acceptance is not available for its models.
 --log-db auto|off|FILE  SQLite log of samples and requests (default: auto)
 --log-every 1.0      seconds between --log-db sample rows
 --log-db-max-mb 1024 size cap for --log-db; oldest rows are dropped (0 = none)
+--export-json PATH  live stats as JSON in a file, replaced atomically (see Stats export)
+--export-sock PATH  the same JSON, one object per line, on a Unix socket
+--tui              keep the dashboard on screen while exporting (see Stats export)
+--export-listen HOST:PORT  serve the export over HTTP (/stats, /stream, /health)
+--export-token-file PATH   bearer token --export-listen requires (no TLS: use a VPN or ssh -L)
 --energy-price 0     electricity price per kWh for GPU energy costs (0 = hide costs)
 --currency '$'       symbol printed before energy costs
 --alerts banner      off | banner | bell | notify (see Alerts)
@@ -1231,6 +1238,42 @@ wins. Only values that differ from the built-in default are kept. The GPU
 selection takes effect at the next launch; everything else applies at once.
 If the file holds a bad value, the dashboard starts without it and says why
 in the status line.
+
+### Stats export
+
+`--export-json PATH` rewrites a JSON file with the live numbers (per-model
+rates, phase, context, current and last request; per-GPU load, memory, power,
+temperatures, clocks) on every poll, and at least once per second even when
+idle. The file is written to a temporary file beside it
+(`.NAME.PID.N.tmp`) and renamed, so a reader never sees a partial file. `--export-sock PATH` serves the same object, one per line, on a
+Unix socket (Linux and macOS); a client that does not read is dropped and the
+dashboard never waits for it. Both work with `--demo` and `--replay`. Missing
+values are `null`, never 0. The format (`llm-visuals.stats/1`) is in
+[docs/export-schema.md](docs/export-schema.md).
+
+With either flag llm-visuals runs **headless**: no terminal, no keys, no tty
+needed, nothing on stdout. Events and errors go to stderr, one
+`llm-visuals: ...` line each: start, models attached or detached, socket
+clients, the first error of an output and its recovery, status messages. It
+looks for new servers by itself (every 5 s while none is attached, then every
+30 s). SIGINT or SIGTERM ends it cleanly (the socket file is removed, exit
+code 0); with `--replay` it exits at the end of the log. Add `--tui` to keep
+the dashboard while exporting. `--export-listen HOST:PORT` also serves the
+export over HTTP (`/stats`, `/stream` as NDJSON, `/health`), with a bearer
+token from `--export-token-file`; there is no TLS, so use a trusted network,
+a VPN or an SSH tunnel. Without a token the `Host` header must be an IP
+address, `localhost`, this machine's hostname (exact, or its first label) or a name from
+`--export-allow-host` (exact; no wildcard). The export also carries the machine's CPU load
+(`system`), the server process's CPU use, and the weight path of the
+Bandwidth view (disk, RAM, PCIe, VRAM and the bottleneck verdict per model),
+so a remote panel can draw where the tokens wait; see
+[docs/export-schema.md](docs/export-schema.md). In `--demo` the bottleneck
+moves through every stage once a minute. `--bench` and `--model` need
+`--tui`. A
+ready `systemd --user` unit for a headless HTTP exporter is in
+[contrib/systemd/llm-visuals-export.service](contrib/systemd/llm-visuals-export.service),
+and a template unit (`llm-visuals-export@.service`) for file and socket
+exports is in [docs/export-schema.md](docs/export-schema.md).
 
 ### SQLite log
 
