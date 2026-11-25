@@ -218,12 +218,14 @@ impl Tracker {
             requests_done: s.finished,
             last: self.last.clone(),
             mtp_max: 0,
+            speculation: None,
             spec,
             maya_version: None,
             tiers: None,
             vram: None,
             label: None,
             cpu_threads: None,
+            ..Default::default()
         }
     }
 }

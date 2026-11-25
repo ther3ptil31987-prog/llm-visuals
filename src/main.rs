@@ -28,6 +28,7 @@ mod offload;
 mod ollama;
 mod perf;
 mod pipeline;
+mod rapid_mlx;
 mod regress;
 mod render;
 mod replay;
@@ -35,6 +36,7 @@ mod safetensors;
 mod settings;
 mod sglang;
 mod strata;
+mod tabby;
 mod tensorfold;
 mod vision;
 mod vllm;
@@ -520,6 +522,67 @@ async fn poll_server(
             tokio::time::sleep(delay).await;
         }
     }
+    if model.engine == "rapid_mlx" {
+        let mut tracker = rapid_mlx::Tracker::default();
+        // The checkpoint's training limit can already be in `model.ctx_max`.
+        // The server's own window is the one on screen; the checkpoint is
+        // only the fallback when `/v1/models` does not answer.
+        let mut ctx = 0usize;
+        let mut asked_ctx = false;
+        let mut misses = 0u32;
+        loop {
+            if !asked_ctx {
+                asked_ctx = true;
+                ctx = rapid_mlx::poll_context(&model.host, port, &auth)
+                    .await
+                    .unwrap_or(0);
+                if ctx == 0 {
+                    ctx = model.ctx_max.unwrap_or(0);
+                }
+            }
+            let status = rapid_mlx::poll_v1_status(&model.host, port, &auth).await;
+            if let Some(sb) = status {
+                misses = 0;
+                let scrape = rapid_mlx::poll_metrics(&model.host, port, &auth).await;
+                let stats = tracker.observe(&sb, ctx, &scrape);
+                let _ = live_tx.try_send((pid, stats));
+                if let Some(sp) = tracker.observe_spec(&scrape.unwrap_or_default()) {
+                    let _ = spec_tx.try_send((pid, sp));
+                }
+            } else {
+                // /v1/status refused or missing: fall back to /metrics alone.
+                let scrape = rapid_mlx::poll_metrics(&model.host, port, &auth).await;
+                if let Some(s) = scrape {
+                    misses = 0;
+                    let mut stats = tracker.observe_metrics(&s);
+                    stats.ctx_max = ctx;
+                    let _ = live_tx.try_send((pid, stats));
+                    if let Some(sp) = tracker.observe_spec(&s) {
+                        let _ = spec_tx.try_send((pid, sp));
+                    }
+                } else {
+                    // Both endpoints failed: increment misses, slow down after 3.
+                    misses = misses.saturating_add(1);
+                    if misses == 3 {
+                        let denied =
+                            observe::auth_refusal(&model.host, port, &auth, "/v1/status").await;
+                        let stats = LiveStats {
+                            ctx_max: ctx,
+                            auth_denied: denied,
+                            ..Default::default()
+                        };
+                        let _ = live_tx.try_send((pid, stats));
+                    }
+                }
+            }
+            let delay = if misses >= 3 {
+                poll.max(Duration::from_secs(2))
+            } else {
+                poll
+            };
+            tokio::time::sleep(delay).await;
+        }
+    }
     if strata::is_family(&model.engine) {
         // Strata is read from its JSON /metrics: one document from a
         // Python server, so never poll it faster than 400 ms.
@@ -534,7 +597,7 @@ async fn poll_server(
                     stats.ctx_max = model.ctx_max.unwrap_or(0);
                 }
                 let _ = live_tx.try_send((pid, stats));
-                if let Some(sp) = m.spec {
+                if let Some(sp) = m.spec.clone().or_else(|| adapter.basalt_spec()) {
                     let _ = spec_tx.try_send((pid, sp));
                 }
             } else {
@@ -557,7 +620,7 @@ async fn poll_server(
             tokio::time::sleep(sleep).await;
         }
     }
-    if model.engine == "vllm" || model.engine == "ninfer" {
+    if matches!(model.engine.as_str(), "vllm" | "ninfer" | "tabbyapi") {
         // vLLM has no /slots or /experts endpoints; its /metrics counters
         // drive the live stats and the MTP panel. The 'r' rescan drops
         // dead processes (same policy as the llama.cpp path); until then a
@@ -572,6 +635,8 @@ async fn poll_server(
         loop {
             let counters = if model.engine == "ninfer" {
                 ninfer::poll(&model.host, port, &model.name, &others, &auth).await
+            } else if model.engine == "tabbyapi" {
+                tabby::poll(&model.host, port, &auth).await
             } else {
                 vllm::poll_vllm(&model.host, port, &model.name, &others, &auth).await
             };

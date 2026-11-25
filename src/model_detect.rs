@@ -824,6 +824,9 @@ pub fn detect_models() -> Vec<DetectedModel> {
                 m.port = Some(port);
             }
         }
+        if m.path.is_none() && m.engine == "rapid_mlx" {
+            m.path = rapid_mlx_weights(m.pid, &m.name);
+        }
         if let Some(path) = m.path.clone() {
             // A containerized server reports the model path as seen from
             // its own mount namespace (e.g. /model); re-anchor it through
@@ -886,8 +889,8 @@ pub fn detect_models() -> Vec<DetectedModel> {
     models.sort_by_key(|m| {
         let has_model = m.path.is_some() || m.gguf.is_some();
         let engine_rank = match m.engine.as_str() {
-            "llama.cpp" | "vllm" | "sglang" | "strata" | "maya" | "ninfer" | "tensorfold"
-            | "exllamav2" => 2,
+            "llama.cpp" | "vllm" | "sglang" | "strata" | "maya" | "basalt" | "ninfer"
+            | "tensorfold" | "rapid_mlx" | "exllamav2" | "tabbyapi" => 2,
             "ollama" => 0,
             _ => 1,
         };
@@ -960,6 +963,9 @@ struct ParsedCmd {
 }
 
 fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
+    if crate::strata::is_gpu_plan(process_name, cmdline) {
+        return false;
+    }
     let p = process_name.to_lowercase();
     let c = cmdline.to_lowercase();
     let keys = [
@@ -1003,6 +1009,9 @@ fn looks_like_llm(process_name: &str, cmdline: &str) -> bool {
         || crate::strata::is_server(cmdline)
         || crate::strata::is_native_run(process_name, cmdline)
         || crate::tensorfold::is_server(cmdline)
+        // TabbyAPI: `python main.py --config ...` from its checkout or venv.
+        || (is_tabby_main(cmdline) && (c.contains("tabby") || c.contains("exllama")))
+        || crate::rapid_mlx::is_server(cmdline)
         || names_a_model(cmdline)
 }
 
@@ -1088,17 +1097,29 @@ fn engine_from(process_name: &str, cmdline: &str) -> String {
         "ninfer".into()
     } else if blob.contains("llama-server") || blob.contains("llama.cpp") {
         "llama.cpp".into()
+    } else if crate::rapid_mlx::is_server(cmdline) {
+        "rapid_mlx".into()
     } else if blob.contains("ollama") {
         "ollama".into()
     } else if blob.contains("vllm") {
         "vllm".into()
     } else if blob.contains("sglang") {
         "sglang".into()
+    } else if blob.contains("tabbyapi") || (blob.contains("exllama") && is_tabby_main(cmdline)) {
+        "tabbyapi".into()
     } else if blob.contains("exllama") {
         "exllamav2".into()
     } else {
         "llm".into()
     }
+}
+
+/// TabbyAPI runs as `python main.py` (or `start.py`) from its checkout, so its
+/// command line only names the interpreter's venv and the config file.
+fn is_tabby_main(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|t| {
+        t == "main.py" || t == "start.py" || t.ends_with("/main.py") || t.ends_with("/start.py")
+    })
 }
 
 fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
@@ -1328,6 +1349,15 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
         i += 1;
     }
 
+    if parsed.engine == "rapid_mlx" {
+        if let Some(name) = crate::rapid_mlx::serve_model_name(cmdline) {
+            parsed.name = name.clone();
+            // `-m rapid_mlx` is the module, not the weights. A repo id
+            // stays a name so the hub cache can resolve it. A local
+            // directory is the path the tensor table is read from.
+            parsed.path = local_weights_path(&name);
+        }
+    }
     if parsed.name.is_empty() {
         parsed.name = Path::new(process_name)
             .file_name()
@@ -1342,6 +1372,38 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     if parsed.port.is_none() && matches!(parsed.engine.as_str(), "llama.cpp" | "ninfer") {
         parsed.port = Some(8080);
     }
+    if parsed.engine == "tabbyapi" && (parsed.port.is_none() || parsed.host.is_empty()) {
+        // The listen address lives in the YAML config, not on the command line.
+        let config = tokens
+            .iter()
+            .position(|t| *t == "--config")
+            .and_then(|i| tokens.get(i + 1))
+            .map(|v| v.to_string())
+            .or_else(|| {
+                tokens
+                    .iter()
+                    .find_map(|t| t.strip_prefix("--config="))
+                    .map(str::to_string)
+            });
+        if let Some(path) = config {
+            let info = crate::tabby::config_info(Path::new(&path));
+            if parsed.port.is_none() {
+                parsed.port = info.port;
+            }
+            if parsed.host.is_empty() {
+                parsed.host = info.host.unwrap_or_default();
+            }
+            if parsed.ctx_max.is_none() {
+                parsed.ctx_max = info.max_seq_len;
+            }
+            if let Some(name) = info.model_name {
+                parsed.name = name;
+            }
+        }
+        if parsed.port.is_none() {
+            parsed.port = Some(crate::tabby::DEFAULT_PORT);
+        }
+    }
     if parsed.port.is_none() && parsed.engine == "ollama" {
         parsed.port = Some(11434);
     }
@@ -1350,6 +1412,9 @@ fn parse_cmdline(process_name: &str, cmdline: &str) -> ParsedCmd {
     }
     if parsed.port.is_none() && parsed.engine == "tensorfold" {
         parsed.port = Some(crate::tensorfold::DEFAULT_PORT);
+    }
+    if parsed.port.is_none() && parsed.engine == "rapid_mlx" {
+        parsed.port = Some(crate::rapid_mlx::DEFAULT_PORT);
     }
     // The Python HTTP front end is the process that binds a port. A native
     // `strata --serve` / `--tokens` child talks over a pipe, so inventing
@@ -1809,6 +1874,43 @@ pub fn parse_v1_models_json(body: &str) -> Option<(String, Option<String>, Optio
     Some((id, root, max_len, owned_by))
 }
 
+/// A `serve` argument that names a directory of weights. A hub repo id
+/// (`org/name`) is not one: that stays a name and is resolved in the cache.
+fn local_weights_path(name: &str) -> Option<PathBuf> {
+    let path_shaped = name.starts_with('/')
+        || name.starts_with('.')
+        || name.starts_with('~')
+        || name.ends_with(".gguf")
+        || name.ends_with(".safetensors");
+    path_shaped.then(|| PathBuf::from(name))
+}
+
+/// A local directory of weights if the serve argument names one, including
+/// a relative path from the server's working directory. The hub cache is
+/// the fallback, so a repo id still resolves and a local `models/qwen`
+/// is not replaced by a cached alias.
+fn rapid_mlx_weights(pid: u32, name: &str) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let resolved = resolve_model_path(pid, Path::new(name), name);
+    if resolved.exists() {
+        Some(resolved)
+    } else {
+        cached_snapshot(name)
+    }
+}
+
+/// The cached snapshot for a repo id or a server alias, searching every hub root.
+fn cached_snapshot(name: &str) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    hf_hub_roots()
+        .into_iter()
+        .find_map(|hub| hf_hub_snapshot(&hub, &[name]))
+}
+
 /// Hugging Face hub cache roots to search for a repo snapshot.
 fn hf_hub_roots() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -2134,6 +2236,8 @@ pub async fn probe_endpoint(
         if let Some(m) = strata {
             engine = if m.maya_version.is_some() {
                 "maya"
+            } else if m.basalt {
+                "basalt"
             } else {
                 "strata"
             }
@@ -2156,6 +2260,8 @@ pub async fn probe_endpoint(
             if let Some(c) = crate::ninfer::parse_metrics(&body) {
                 model_name = c.model_name.or(model_name);
             }
+        } else if body.contains("tabbyapi:tokens_predicted_total") {
+            engine = "tabbyapi".to_string();
         } else if body.contains("vllm:") {
             saw_vllm_metrics = true;
             engine = "vllm".to_string();
@@ -2166,6 +2272,8 @@ pub async fn probe_endpoint(
             }
         } else if body.contains("llamacpp:") {
             engine = "llama.cpp".to_string();
+        } else if body.contains("rapid_mlx_completion_tokens_total") {
+            engine = "rapid_mlx".to_string();
         } else if body.contains("sglang:") {
             engine = "sglang".to_string();
         }
@@ -2178,7 +2286,14 @@ pub async fn probe_endpoint(
     // key, since they come from /metrics.
     if model_name.is_none() {
         if let Some(h) = crate::strata::poll_health(host, port, auth).await {
-            engine = if h.maya { "maya" } else { "strata" }.to_string();
+            engine = if h.maya {
+                "maya"
+            } else if h.basalt {
+                "basalt"
+            } else {
+                "strata"
+            }
+            .to_string();
             model_name = h.model;
             if ctx_max.is_none() {
                 ctx_max = (h.max_context > 0).then_some(h.max_context);
@@ -2224,8 +2339,15 @@ pub async fn probe_endpoint(
     let final_name = match model_name {
         Some(n) => n,
         None if saw_vllm_metrics => format!("vllm-{port}"),
+        // `/metrics` named the engine and `/v1/models` did not. The
+        // aggregate counters are still worth polling.
+        None if engine == "rapid_mlx" => format!("rapid-mlx-{port}"),
         None => return None,
     };
+
+    if model_path.is_none() {
+        model_path = cached_snapshot(&final_name);
+    }
 
     let mut resolved_path = model_path.clone();
     let mut gguf_info = None;
@@ -2348,6 +2470,29 @@ fn extra_probe_ips(ips: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tabby_launch_is_detected() {
+        let dir = std::env::temp_dir().join(format!("llmv-tabby-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("model-run-9104.yml");
+        std::fs::write(&cfg, "network:\n  host: 127.0.0.1\n  port: 9104\nmodel:\n  model_name: m\n  max_seq_len: 8192\n").unwrap();
+        let cmd = format!(
+            "/opt/exllamav3/venv/bin/python main.py --config {}",
+            cfg.display()
+        );
+        assert!(super::looks_like_llm("python", &cmd));
+        let model = super::parse_cmdline("python", &cmd);
+        assert_eq!(model.engine, "tabbyapi");
+        assert_eq!(model.port, Some(9104));
+        assert_eq!(model.host, "127.0.0.1");
+        assert_eq!(model.ctx_max, Some(8192));
+        assert_eq!(model.name, "m");
+        let bare = super::parse_cmdline("python", "/srv/tabbyAPI/venv/bin/python main.py");
+        assert_eq!(bare.engine, "tabbyapi");
+        assert_eq!(bare.port, Some(crate::tabby::DEFAULT_PORT));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn ninfer_launch_is_detected() {
         let cmd = "ninfer-serve models/qwen.ninfer --model-id qwen-test --max-context 8192";
         assert!(super::looks_like_llm("ninfer-serve", cmd));
@@ -2356,6 +2501,19 @@ mod tests {
         assert_eq!(model.name, "qwen-test");
         assert_eq!(model.ctx_max, Some(8192));
         assert_eq!(model.port, Some(8080));
+    }
+
+    #[test]
+    fn basalt_gpu_plan_is_not_a_model() {
+        // The pack is a directory, so `--model <dir>` alone would read as a model.
+        let pack = std::env::temp_dir();
+        let plan = format!(
+            "/opt/basalt/bin/basalt --model {} --kv fp8 --gpu-plan",
+            pack.display()
+        );
+        assert!(!super::looks_like_llm("basalt", &plan));
+        let serve = format!("/opt/basalt/bin/basalt --serve --model {}", pack.display());
+        assert!(super::looks_like_llm("basalt", &serve));
     }
 
     #[test]
@@ -2429,6 +2587,47 @@ mod tests {
             .path
             .as_deref()
             .is_some_and(|p| p.ends_with("Qwen3.6-35B-A3B.gguf")));
+    }
+
+    #[test]
+    fn rapid_mlx_launch_uses_the_serve_model() {
+        let cmd = "rapid-mlx serve qwen3.5-4b-4bit --port 8000";
+        assert!(super::looks_like_llm("rapid-mlx", cmd));
+        let model = super::parse_cmdline("rapid-mlx", cmd);
+        assert_eq!(model.engine, "rapid_mlx");
+        assert_eq!(model.name, "qwen3.5-4b-4bit");
+        assert_eq!(model.port, Some(8000));
+
+        // `python -m` must not become the model name, and the module
+        // token must not stay behind as the weights path.
+        let py = super::parse_cmdline("python", "python -m rapid_mlx serve qwen3.5-4b-4bit");
+        assert_eq!(py.engine, "rapid_mlx");
+        assert_eq!(py.name, "qwen3.5-4b-4bit");
+        assert_eq!(py.port, Some(8000));
+        assert!(py.path.is_none());
+
+        let local = super::parse_cmdline("rmlx", "rmlx serve /models/qwen");
+        assert_eq!(
+            local.path.as_deref(),
+            Some(std::path::Path::new("/models/qwen"))
+        );
+        let repo = super::parse_cmdline(
+            "rapid-mlx",
+            "rapid-mlx serve mlx-community/Qwen3.5-4B-MLX-4bit",
+        );
+        assert!(repo.path.is_none());
+        assert_eq!(repo.name, "mlx-community/Qwen3.5-4B-MLX-4bit");
+    }
+
+    #[test]
+    fn rapid_mlx_relative_dir_is_the_weights_path() {
+        let name = format!("rapid-mlx-rel-{}", std::process::id());
+        std::fs::create_dir(&name).unwrap();
+        let found = super::rapid_mlx_weights(0, &name);
+        let _ = std::fs::remove_dir(&name);
+        let found = found.expect("local dir");
+        assert!(found.ends_with(&name));
+        assert!(super::rapid_mlx_weights(0, "org/not-a-local-rapid-mlx-dir-zz").is_none());
     }
 
     #[test]

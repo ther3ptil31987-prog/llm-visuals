@@ -27,6 +27,14 @@
 //! VRAM by use (`gpu_map`). It runs its vision encoder as a separate
 //! `maya-vision` helper. The engine is named `maya` so it reads as itself
 //! on screen and in the log; [`is_family`] keeps the two on one adapter.
+//!
+//! Basalt (github.com/jesdga95/basalt) is a Blackwell fork of Strata with the
+//! same shape: `python -m serve.server --engine-bin …/basalt --config X.json`
+//! drives a native `basalt --serve --model X.basalt` child. Its `/metrics` is
+//! this document with a few differences, read here: `requests[]` carries
+//! `decode_tok_s` instead of `decode_ms`, the draft counts (DSpark) are per
+//! request only, the draft depth is `engine.spec`, and each card's VRAM by use
+//! is `hardware.gpus[].vram_parts`. Its config is a v2 file (`models[]`).
 
 use crate::observe::{http_get, http_get_json, ClosingRequest, HttpAuth, LiveStats, SpecMetrics};
 use serde_json::Value;
@@ -91,6 +99,10 @@ pub struct StrataMetrics {
     pub last: Option<StrataRequest>,
     /// MTP draft depth (`engine.mtp_max`); 0 when speculation is off.
     pub mtp_max: usize,
+    /// The engine's own name for its drafting (`engine.speculation`, Maya's
+    /// `["MTP"]`). None on Strata and Maya builds that predate the list;
+    /// those name MTP through `mtp_max` instead.
+    pub speculation: Option<String>,
     /// Running draft totals (`totals.drafts_offered` / `drafts_accepted`,
     /// Strata 0.1.35+). None on older servers.
     pub spec: Option<SpecMetrics>,
@@ -104,6 +116,23 @@ pub struct StrataMetrics {
     pub label: Option<String>,
     /// `engine.cpu_threads`: the threads Maya's CPU lane computes with.
     pub cpu_threads: Option<u32>,
+    /// The server is Basalt's (`models[].owned_by == "basalt"`).
+    pub basalt: bool,
+    /// Basalt's draft depth (`engine.spec`, DSpark); 0 elsewhere.
+    pub spec_max: usize,
+    /// Basalt: the draft counts of the finished requests it still lists,
+    /// newest first. Its totals carry none, so [`StrataAdapter`] adds up the
+    /// requests that finish between two polls into running totals.
+    pub basalt_requests: Vec<BasaltDrafts>,
+}
+
+/// One finished Basalt request's drafts (`requests[]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BasaltDrafts {
+    pub offered: u64,
+    pub accepted: u64,
+    pub output: u64,
+    pub decode_ms: f64,
 }
 
 /// Where a Maya engine found the experts its tokens routed to (`tiers.now`,
@@ -248,8 +277,38 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
             output_tokens: usize_at(r, "output_tokens").unwrap_or(0),
             prompt_read: usize_at(r, "prompt_read"),
             prompt_ms: f64_at(r, "prompt_ms").unwrap_or(0.0),
-            decode_ms: f64_at(r, "decode_ms").unwrap_or(0.0),
+            // Basalt reports the decode rate, not its duration.
+            decode_ms: f64_at(r, "decode_ms")
+                .or_else(|| {
+                    let rate = f64_at(r, "decode_tok_s").filter(|x| *x > 0.0)?;
+                    Some(usize_at(r, "output_tokens")? as f64 * 1000.0 / rate)
+                })
+                .unwrap_or(0.0),
         });
+    let basalt = v.get("models").and_then(|m| m.as_array()).is_some_and(|a| {
+        a.iter()
+            .any(|m| m.get("owned_by").and_then(|o| o.as_str()) == Some("basalt"))
+    });
+    let basalt_requests = basalt
+        .then(|| v.get("requests").and_then(|r| r.as_array()))
+        .flatten()
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    let output = usize_at(r, "output_tokens").unwrap_or(0) as u64;
+                    BasaltDrafts {
+                        offered: usize_at(r, "drafts_offered").unwrap_or(0) as u64,
+                        accepted: usize_at(r, "drafts_accepted").unwrap_or(0) as u64,
+                        output,
+                        decode_ms: f64_at(r, "decode_tok_s")
+                            .filter(|x| *x > 0.0)
+                            .map(|rate| output as f64 * 1000.0 / rate)
+                            .unwrap_or(0.0),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let totals = v.get("totals");
     let total = |k: &str| totals.and_then(|t| usize_at(t, k)).map(|n| n as u64);
     let spec = match (total("drafts_offered"), total("drafts_accepted")) {
@@ -265,8 +324,26 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
                 busy_secs: totals.and_then(|t| f64_at(t, "decode_ms")).unwrap_or(0.0) / 1000.0,
             })
         }
+        // Maya names no draft totals; its finished requests each carry the
+        // drafts they offered and had accepted. The array is capped, so a
+        // long session's gauge reads as its recent window rather than its
+        // whole life.
+        // Basalt's request list is capped too, and its adapter keeps running
+        // totals of its own instead.
+        _ if !basalt => spec_from_requests(v.get("requests")),
         _ => None,
     };
+    let speculation = engine
+        .get("speculation")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .filter(|s| !s.is_empty());
     Some(StrataMetrics {
         model: engine
             .get("model")
@@ -289,6 +366,7 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
         requests_done: total("requests").unwrap_or(0),
         last,
         mtp_max: usize_at(engine, "mtp_max").unwrap_or(0),
+        speculation,
         spec,
         maya_version: engine
             .get("maya_version")
@@ -296,7 +374,10 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         tiers: v.get("tiers").and_then(parse_tiers),
-        vram: v.get("gpu_map").and_then(parse_gpu_map),
+        vram: v
+            .get("gpu_map")
+            .and_then(parse_gpu_map)
+            .or_else(|| v.get("hardware").and_then(parse_basalt_vram)),
         label: engine
             .get("model_label")
             .and_then(|m| m.as_str())
@@ -305,11 +386,70 @@ pub fn parse_metrics(body: &str) -> Option<StrataMetrics> {
         cpu_threads: usize_at(engine, "cpu_threads")
             .filter(|n| *n > 0)
             .map(|n| n as u32),
+        basalt,
+        spec_max: if basalt {
+            usize_at(engine, "spec").unwrap_or(0)
+        } else {
+            0
+        },
+        basalt_requests,
     })
+}
+
+/// Basalt's `hardware.gpus[].vram_parts` (bytes): experts, KV cache, rest.
+fn parse_basalt_vram(hw: &Value) -> Option<VramSplit> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let cards = hw.get("gpus")?.as_array().filter(|a| !a.is_empty())?;
+    let mut out = VramSplit::default();
+    let mut any = false;
+    for card in cards {
+        let Some(parts) = card.get("vram_parts").filter(|p| p.is_object()) else {
+            continue;
+        };
+        any = true;
+        out.weights_gb += (f64_at(parts, "experts").unwrap_or(0.0) / GIB) as f32;
+        out.kv_gb += (f64_at(parts, "kv").unwrap_or(0.0) / GIB) as f32;
+        out.other_gb += (f64_at(parts, "other").unwrap_or(0.0) / GIB) as f32;
+    }
+    any.then_some(out)
 }
 
 fn f64_at(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(|x| x.as_f64())
+}
+
+/// Draft totals summed over a `/metrics` request list (Maya 1.1.69+). Every
+/// entry is a closed request — an in-flight one joins the list only when it
+/// finishes — so the counts are final, never mid-flight partials.
+fn spec_from_requests(requests: Option<&Value>) -> Option<SpecMetrics> {
+    let rows = requests?.as_array()?;
+    let mut offered = 0u64;
+    let mut accepted = 0u64;
+    let mut output = 0u64;
+    let mut busy_ms = 0.0f64;
+    let mut any = false;
+    for r in rows {
+        let (Some(o), Some(a)) = (
+            usize_at(r, "drafts_offered").map(|n| n as u64),
+            usize_at(r, "drafts_accepted").map(|n| n as u64),
+        ) else {
+            continue;
+        };
+        any = true;
+        offered += o;
+        accepted += a;
+        output += usize_at(r, "output_tokens").unwrap_or(0) as u64;
+        busy_ms += f64_at(r, "decode_ms").unwrap_or(0.0);
+    }
+    (any && offered > 0).then(|| SpecMetrics {
+        draft_tokens: offered,
+        accepted,
+        // Each verify step emits one token plus its accepted drafts.
+        verify_steps: output.saturating_sub(accepted),
+        n_decode: output,
+        tokens_predicted: output,
+        busy_secs: busy_ms / 1000.0,
+    })
 }
 
 fn usize_at(v: &Value, k: &str) -> Option<usize> {
@@ -333,13 +473,17 @@ pub struct StrataHealth {
     /// Maya's `/health`, which carries its version where Strata names its
     /// service.
     pub maya: bool,
+    /// Basalt's `/health` (`"service":"basalt"`).
+    pub basalt: bool,
 }
 
 /// Parse `/health`. `None` unless it is Strata's or Maya's: llama.cpp
 /// answers the same path with a bare `{"status":"ok"}`.
 pub fn parse_health(body: &str) -> Option<StrataHealth> {
     let v: Value = serde_json::from_str(body).ok()?;
-    let strata = v.get("service").and_then(|s| s.as_str()) == Some("strata");
+    let service = v.get("service").and_then(|s| s.as_str());
+    let basalt = service == Some("basalt");
+    let strata = service == Some("strata") || basalt;
     // Maya names no service; its version beside the MCP switch is its own.
     let maya = !strata
         && v.get("version").is_some_and(Value::is_string)
@@ -349,6 +493,7 @@ pub fn parse_health(body: &str) -> Option<StrataHealth> {
     }
     Some(StrataHealth {
         maya,
+        basalt,
         model: v
             .get("model")
             .and_then(|m| m.as_str())
@@ -387,12 +532,16 @@ pub fn live_stats(m: &StrataMetrics) -> LiveStats {
         id_task,
         n_slots: m.parallel.max(1),
         slots_busy: m.in_flight(),
-        spec_types: if m.mtp_max > 0 {
-            "mtp".into()
-        } else {
-            "none".into()
-        },
-        spec_depth: m.mtp_max,
+        spec_types: m.speculation.clone().unwrap_or_else(|| {
+            if m.mtp_max > 0 {
+                "mtp".into()
+            } else if m.spec_max > 0 {
+                "dspark".into()
+            } else {
+                "none".into()
+            }
+        }),
+        spec_depth: if m.mtp_max > 0 { m.mtp_max } else { m.spec_max },
         // Live progress includes cache hits and advances by whole chunks.
         // Without an engine clock, wait for the completed request's timing
         // instead of dividing those positions by one HTTP poll interval.
@@ -443,6 +592,8 @@ pub fn live_stats(m: &StrataMetrics) -> LiveStats {
 #[derive(Default)]
 pub struct StrataAdapter {
     previous: Option<StrataMetrics>,
+    /// Basalt's draft counts, added up here (see [`StrataMetrics::basalt_requests`]).
+    basalt_spec: Option<SpecMetrics>,
     /// The request in flight has had the engine's live prefill rate on the
     /// meter, so its closing sample has nothing new to show there.
     live_rate_shown: bool,
@@ -482,14 +633,37 @@ impl StrataAdapter {
                 }
             }
         }
+        if m.basalt {
+            // The requests that finished since the last poll are the newest
+            // entries of the list; the first poll counts all it lists.
+            let done = match &self.previous {
+                Some(p) => m.requests_done.saturating_sub(p.requests_done) as usize,
+                None => m.basalt_requests.len(),
+            };
+            let sp = self.basalt_spec.get_or_insert_with(SpecMetrics::default);
+            for r in m.basalt_requests.iter().take(done) {
+                sp.draft_tokens += r.offered;
+                sp.accepted += r.accepted;
+                sp.n_decode += r.output;
+                sp.tokens_predicted += r.output;
+                // Each verify step emits one token plus its accepted drafts.
+                sp.verify_steps += r.output.saturating_sub(r.accepted);
+                sp.busy_secs += r.decode_ms / 1000.0;
+            }
+        }
         self.previous = Some(m.clone());
         stats
+    }
+
+    /// Basalt's running draft totals, None before any drafted request.
+    pub fn basalt_spec(&self) -> Option<SpecMetrics> {
+        self.basalt_spec.clone().filter(|sp| sp.draft_tokens > 0)
     }
 }
 
 /// Engine names served by this adapter.
 pub fn is_family(engine: &str) -> bool {
-    matches!(engine, "strata" | "maya")
+    matches!(engine, "strata" | "maya" | "basalt")
 }
 
 /// The base name of argv[0], lower-cased, without `.exe`.
@@ -516,6 +690,22 @@ pub fn is_server(cmdline: &str) -> bool {
 /// `strata` or `maya`. Newer Maya servers (the Hy4 engine) name themselves.
 pub fn server_engine(cmdline: &str) -> Option<&'static str> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    // Basalt: `python -m serve.server --engine-bin …/basalt --config …`.
+    if toks
+        .iter()
+        .any(|t| *t == "serve.server" || t.ends_with("/server.py") || *t == "server.py")
+        && toks.iter().enumerate().any(|(i, t)| {
+            t.strip_prefix("--engine-bin=")
+                .or_else(|| {
+                    (*t == "--engine-bin")
+                        .then(|| toks.get(i + 1).copied())
+                        .flatten()
+                })
+                .is_some_and(|b| argv0_base("", b).starts_with("basalt"))
+        })
+    {
+        return Some("basalt");
+    }
     if !toks
         .iter()
         .any(|t| Path::new(t).file_name().is_some_and(|f| f == "server.py"))
@@ -537,10 +727,10 @@ pub fn server_engine(cmdline: &str) -> Option<&'static str> {
 pub fn is_native_binary(process_name: &str, cmdline: &str) -> bool {
     // Per-model builds carry a suffix (`strata-dsv41`, `strata-q36`, `maya-ds4`).
     let base = argv0_base(process_name, cmdline);
-    if base == "maya-vision" || base == "strata-vision" {
+    if base == "maya-vision" || base == "strata-vision" || base == "basalt-vision" {
         return false;
     }
-    ["strata", "maya"]
+    ["strata", "maya", "basalt"]
         .iter()
         .any(|n| base == *n || base.strip_prefix(n).is_some_and(|r| r.starts_with('-')))
 }
@@ -554,6 +744,8 @@ pub fn native_engine_name(process_name: &str, cmdline: &str) -> Option<&'static 
     let base = argv0_base(process_name, cmdline);
     Some(if base == "maya" || base.starts_with("maya-") {
         "maya"
+    } else if base == "basalt" || base.starts_with("basalt-") {
+        "basalt"
     } else {
         "strata"
     })
@@ -562,7 +754,7 @@ pub fn native_engine_name(process_name: &str, cmdline: &str) -> Option<&'static 
 /// A native engine that is actually running a model (`--native` / `--serve`
 /// / `--tokens` / a bench), not `strata --help` or a similarly named tool.
 pub fn is_native_run(process_name: &str, cmdline: &str) -> bool {
-    if !is_native_binary(process_name, cmdline) {
+    if !is_native_binary(process_name, cmdline) || is_gpu_plan(process_name, cmdline) {
         return false;
     }
     cmdline.split_whitespace().any(|t| {
@@ -573,6 +765,14 @@ pub fn is_native_run(process_name: &str, cmdline: &str) -> bool {
             || t.starts_with("--model=")
             || t.starts_with("--bench")
     })
+}
+
+/// Basalt's server asks the engine which cards to use before starting it:
+/// `basalt --model X … --gpu-plan` prints one JSON line and exits. It names a
+/// model but loads none and serves nothing, so it is not a model; counting it
+/// showed a second row for a few moments while the lane loaded.
+pub fn is_gpu_plan(process_name: &str, cmdline: &str) -> bool {
+    is_native_binary(process_name, cmdline) && cmdline.split_whitespace().any(|t| t == "--gpu-plan")
 }
 
 /// The native `strata --serve` child (Maya's `maya` / `maya-ds4`). It holds
@@ -591,7 +791,7 @@ pub fn is_engine(process_name: &str, cmdline: &str) -> bool {
 pub fn is_helper(process_name: &str, cmdline: &str) -> bool {
     matches!(
         argv0_base(process_name, cmdline).as_str(),
-        "maya-vision" | "strata-vision"
+        "maya-vision" | "strata-vision" | "basalt-vision"
     )
 }
 
@@ -640,6 +840,21 @@ pub fn parse_config(body: &str) -> Option<StrataConfig> {
             .and_then(|i| args.get(i + 1))
             .map(|s| s.to_string())
     };
+    // Basalt's v2 config: `{"version":2,"models":[{"alias","model","max-context",…}]}`.
+    if let Some(m) = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.first())
+    {
+        let s = |k: &str| m.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        return Some(StrataConfig {
+            model_name: s("alias"),
+            gguf: s("model").map(PathBuf::from),
+            max_context: usize_at(m, "max-context"),
+            api_key,
+            ..Default::default()
+        });
+    }
     Some(StrataConfig {
         model_name: v
             .get("model_name")
@@ -756,6 +971,78 @@ mod tests {
             perf.observe(&stats, now + Duration::from_millis(400 * i as u64));
         }
         perf
+    }
+
+    const BASALT_SERVER: &str = "/opt/basalt/.venv/bin/python -m serve.server --engine-bin /opt/basalt/bin/basalt --config /opt/basalt/inkling.json --port 9100";
+    const BASALT_ENGINE: &str = "/opt/basalt/bin/basalt --serve --model /m/Inkling-2-Mini-NVFP4-q8.basalt --kv fp16 --max-context 262144 --vision --gpu 0";
+
+    #[test]
+    fn basalt_processes_are_recognised() {
+        assert_eq!(server_engine(BASALT_SERVER), Some("basalt"));
+        assert!(is_server(BASALT_SERVER));
+        assert!(is_engine("basalt", BASALT_ENGINE));
+        assert_eq!(native_engine_name("basalt", BASALT_ENGINE), Some("basalt"));
+        assert!(is_helper(
+            "basalt-vision",
+            "/opt/basalt/bin/basalt-vision --x"
+        ));
+        assert!(is_family("basalt"));
+        // A Python server that is not Basalt's stays unrecognised.
+        assert_eq!(server_engine("python -m serve.server --port 1"), None);
+    }
+
+    #[test]
+    fn basalt_v2_config_names_model_and_context() {
+        let cfg = parse_config(r#"{"version":2,"models":[{"alias":"inkling-262k","model":"/m/x.basalt","kv":"fp16","max-context":262144}],"server":{"host":"127.0.0.1"}}"#).unwrap();
+        assert_eq!(cfg.model_name.as_deref(), Some("inkling-262k"));
+        assert_eq!(cfg.gguf, Some(PathBuf::from("/m/x.basalt")));
+        assert_eq!(cfg.max_context, Some(262144));
+        assert!(!cfg.maya);
+    }
+
+    #[test]
+    fn basalt_metrics_and_health_parse() {
+        let h = parse_health(
+            r#"{"status":"ok","max_context":262144,"model":"ink","service":"basalt"}"#,
+        )
+        .unwrap();
+        assert!(h.basalt && !h.maya);
+        let body = r#"{"engine":{"model":"ink","max_context":262144,"spec":8,"mtp_max":0},
+            "live":{"state":"generating","prompt_tokens":1000,"generated":40,"prefill_tok_s_mean":2000.0},
+            "requests":[{"prompt_tokens":900,"reused":800,"output_tokens":100,"prompt_ms":50.0,
+                          "decode_tok_s":200.0,"drafts_offered":80,"drafts_accepted":60},
+                         {"prompt_tokens":500,"reused":0,"output_tokens":50,"prompt_ms":40.0,
+                          "decode_tok_s":250.0,"drafts_offered":40,"drafts_accepted":30}],
+            "totals":{"requests":2,"decode_ms":700.0},
+            "hardware":{"gpus":[{"vram_parts":{"experts":1073741824,"kv":2147483648,"other":536870912}}]},
+            "models":[{"id":"ink","owned_by":"basalt"}]}"#;
+        let m = parse_metrics(body).unwrap();
+        assert!(m.basalt);
+        assert_eq!(m.spec_max, 8);
+        assert!(m.spec.is_none());
+        assert_eq!(m.last.as_ref().unwrap().decode_ms, 500.0);
+        let v = m.vram.unwrap();
+        assert_eq!((v.weights_gb, v.kv_gb, v.other_gb), (1.0, 2.0, 0.5));
+        let s = live_stats(&m);
+        assert_eq!(s.spec_types, "dspark");
+        assert_eq!(s.spec_depth, 8);
+        let mut a = StrataAdapter::default();
+        a.observe(&m);
+        let sp = a.basalt_spec().unwrap();
+        assert_eq!((sp.draft_tokens, sp.accepted, sp.n_decode), (120, 90, 150));
+        // A third request finishes: only it is added.
+        let next = body
+            .replace(r#""requests":[{"#, r#""requests":[{"prompt_tokens":10,"output_tokens":10,"decode_tok_s":100.0,"drafts_offered":10,"drafts_accepted":5},{"#)
+            .replace(r#""requests":2,"#, r#""requests":3,"#);
+        a.observe(&parse_metrics(&next).unwrap());
+        let sp = a.basalt_spec().unwrap();
+        assert_eq!((sp.draft_tokens, sp.accepted, sp.n_decode), (130, 95, 160));
+        // Strata's own documents are untouched.
+        assert!(
+            !parse_metrics(r#"{"engine":{},"live":{"state":"idle"}}"#)
+                .unwrap()
+                .basalt
+        );
     }
 
     #[test]
@@ -1058,6 +1345,61 @@ mod tests {
     }
 
     #[test]
+    fn maya_names_its_speculation_and_sums_the_requests_drafts() {
+        // Maya 1.1.69 has no `engine.mtp_max` and no draft totals: it names
+        // its drafting in `engine.speculation` and reports each finished
+        // request's drafts beside it. `engine.mtp` counts MTP layers, not
+        // draft depth — one layer chains several drafts.
+        let m = parse_metrics(
+            r#"{"engine":{"mtp":1,"dflash":0,"speculation":["MTP"],
+                        "maya_version":"1.1.69","max_context":262144},
+                "live":{"state":"idle"},
+                "totals":{"requests":2,"output_tokens":900,"decode_ms":9000.0},
+                "requests":[
+                    {"finish":"length","drafts_offered":118,"drafts_accepted":105,
+                     "output_tokens":120,"decode_ms":3000.0},
+                    {"finish":"stop","drafts_offered":333,"drafts_accepted":276,
+                     "output_tokens":335,"decode_ms":4000.0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.speculation.as_deref(), Some("MTP"));
+        assert_eq!(m.mtp_max, 0);
+        assert_eq!(m.maya_version.as_deref(), Some("1.1.69"));
+        let sp = m.spec.clone().expect("drafts summed over the request list");
+        assert_eq!((sp.draft_tokens, sp.accepted), (451, 381));
+        assert_eq!(sp.verify_steps, 455 - 381);
+        assert_eq!(sp.tokens_predicted, 455);
+        assert!((sp.busy_secs - 7.0).abs() < 1e-9);
+        let s = live_stats(&m);
+        assert_eq!(s.spec_types, "MTP");
+    }
+
+    #[test]
+    fn an_older_maya_without_a_speculation_list_reads_as_before() {
+        // fixtures/maya-metrics.json shape: `mtp` is 0 and nothing names the
+        // drafting, so the panel keeps saying no speculative decoding.
+        let m = parse_metrics(
+            r#"{"engine":{"mtp":0,"dflash":0,"maya_version":"1.1.25",
+                        "max_context":32768},
+                "live":{"state":"idle"},"requests":[{"output_tokens":10}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.speculation, None);
+        assert!(m.spec.is_none());
+        let s = live_stats(&m);
+        assert_eq!(s.spec_types, "none");
+    }
+
+    #[test]
+    fn strata_depth_still_names_mtp_when_no_list_is_present() {
+        let m = parse_metrics(r#"{"engine":{"mtp_max":4},"live":{"state":"generating"}}"#).unwrap();
+        assert_eq!(m.speculation, None);
+        let s = live_stats(&m);
+        assert_eq!(s.spec_types, "mtp");
+        assert_eq!(s.spec_depth, 4);
+    }
+
+    #[test]
     fn other_servers_metrics_do_not_match() {
         assert!(parse_metrics("vllm:prompt_tokens_total 1\n").is_none());
         assert!(parse_metrics(r#"{"engine":{}}"#).is_none());
@@ -1172,6 +1514,15 @@ mod tests {
             Some("strata")
         );
         assert!(!is_native_run("strata-q36", "./strata-q36 --help"));
+        let plan =
+            "/opt/basalt/bin/basalt --model /m/Inkling-2-Mini-NVFP4-q8.basalt --kv fp8 --gpu-plan";
+        assert!(is_gpu_plan("basalt", plan));
+        assert!(!is_native_run("basalt", plan));
+        assert!(!is_gpu_plan(
+            "basalt",
+            "/opt/basalt/bin/basalt --serve --model /m/x.basalt"
+        ));
+        assert!(!is_gpu_plan("python3", "python3 tool.py --gpu-plan"));
         assert!(!is_native_binary("stratagem", "/bin/stratagem --serve"));
         assert!(!is_native_binary(
             "strata-vision",
